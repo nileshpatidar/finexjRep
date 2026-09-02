@@ -12,6 +12,9 @@ export interface UserProfile {
   createdAt: string;
   twoFactorEnabled: boolean;
   profilePictureUrl?: string;
+  fundLockUntil?: string;
+  fundLockReason?: string;
+  lastWithdrawalAt?: string;
 }
 
 export interface UserBalanceSummary {
@@ -29,24 +32,38 @@ export interface UserBalanceSummary {
   canWithdraw: boolean;
   withdrawalRestrictionReason?: string;
   withdrawalEligibleDate: string;
+  isFundLocked: boolean;
+  fundLockUntil?: string;
+  fundLockRemainingDays: number;
+  fundLockRemainingHours: number;
+  fundLockReason?: string;
 }
 
 export interface DepositItem {
   id: string;
   userId: string;
   amount: number;
+  actualAmount?: number;
   currency: 'USDT';
   network: 'BEP-20';
   txHash: string;
   fromAddress?: string;
   toAddress: string;
+  tokenContract?: string;
+  blockNumber?: number;
   status: 'pending' | 'confirming' | 'confirmed' | 'rejected';
   confirmations: number;
   requiredConfirmations: number;
   createdAt: string;
   confirmedAt?: string;
+  verifiedAt?: string;
   eligibilityDate?: string;
   depositLockEndDate?: string;
+  proofPhotoUrl?: string;
+  userNotes?: string;
+  adminNotes?: string;
+  reviewedAt?: string;
+  reviewedBy?: string;
   notes?: string;
 }
 
@@ -69,6 +86,20 @@ export interface WithdrawalItem {
   userNotes?: string;
 }
 
+export interface DailyPerformance {
+  id: string;
+  date: string;
+  overallFundAmount: number;
+  actualFundPerformance: number;
+  applicableRate: number;
+  notes: string;
+  createdBy: string;
+  createdAt: string;
+  appliedCount: number;
+  totalDistributed: number;
+  marketCondition?: 'profit' | 'loss' | 'neutral';
+}
+
 export interface EarningItem {
   id: string;
   userId: string;
@@ -79,12 +110,14 @@ export interface EarningItem {
   performanceDate: string;
   createdAt: string;
   status: 'credited' | 'reversed';
+  marketCondition?: 'profit' | 'loss' | 'neutral';
+  note?: string;
 }
 
 export interface LedgerItem {
   id: string;
   userId: string;
-  type: 'deposit' | 'daily_earnings' | 'withdrawal_request' | 'withdrawal_fee' | 'withdrawal_paid' | 'withdrawal_rejected' | 'admin_adjustment' | 'reversal';
+  type: 'deposit' | 'daily_earnings' | 'daily_loss' | 'withdrawal_request' | 'withdrawal_fee' | 'withdrawal_paid' | 'withdrawal_rejected' | 'admin_adjustment' | 'reversal';
   amount: number;
   balanceAfter: number;
   referenceId?: string;
@@ -104,12 +137,55 @@ export interface AppSettings {
   bep20DepositAddress: string;
   usdtContractAddress: string;
   requiredConfirmations: number;
+  minimumDepositAmount: number;
   withdrawalFeePercentage: number;
   accountAgeRequirementDays: number;
   depositLockPeriodDays: number;
   telegramSupportUrl: string;
   operationalWalletAddress?: string;
   compoundingEnabled?: boolean;
+  maintenanceMode?: boolean;
+  registrationEnabled?: boolean;
+  loginEnabled?: boolean;
+  sessionVersion?: number;
+  systemLogRetentionDays?: number;
+  errorLogRetentionDays?: number;
+  notificationRetentionDays?: number;
+}
+
+export interface SystemLogItem {
+  id: string;
+  level: 'DEBUG' | 'INFO' | 'WARN' | 'ERROR';
+  event: string;
+  errorCode?: string;
+  message: string;
+  requestId?: string;
+  userId?: string;
+  adminId?: string;
+  route?: string;
+  method?: string;
+  durationMs?: number;
+  metadata?: Record<string, any>;
+  createdAt: string;
+}
+
+export interface SystemHealthStats {
+  totalUsers: number;
+  totalDeposits: number;
+  totalWithdrawals: number;
+  totalLedgerRecords: number;
+  totalAuditLogs: number;
+  totalSystemLogs: number;
+  totalDepositProofs: number;
+  errorsToday: number;
+  warningsToday: number;
+  infoToday: number;
+  dbLoggingEnabled?: boolean;
+  retentionSettings: {
+    systemLogRetentionDays: number;
+    errorLogRetentionDays: number;
+    notificationRetentionDays: number;
+  };
 }
 
 export interface DashboardResponse {

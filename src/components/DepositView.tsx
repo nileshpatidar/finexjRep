@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { QRCodeSVG } from 'qrcode.react';
 import { api } from '../services/api';
 import { DepositItem, AppSettings } from '../types';
@@ -9,11 +9,17 @@ import {
   AlertTriangle,
   ShieldCheck,
   Loader2,
-  Sparkles,
-  ExternalLink,
-  Clock,
   CheckCircle2,
   XCircle,
+  Upload,
+  Image as ImageIcon,
+  ExternalLink,
+  Eye,
+  X,
+  FileCheck,
+  Clock,
+  RefreshCw,
+  Layers,
 } from 'lucide-react';
 
 interface DepositViewProps {
@@ -24,12 +30,19 @@ export const DepositView: React.FC<DepositViewProps> = ({ onDepositConfirmed }) 
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [deposits, setDeposits] = useState<DepositItem[]>([]);
   const [txHash, setTxHash] = useState('');
-  const [amount, setAmount] = useState<string>('100');
+  const [amount, setAmount] = useState<string>('300');
+  const [userNotes, setUserNotes] = useState('');
+  const [proofPhotoUrl, setProofPhotoUrl] = useState<string | null>(null);
+  const [proofFileName, setProofFileName] = useState<string | null>(null);
+  const [previewModalImage, setPreviewModalImage] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [verifyingDepositId, setVerifyingDepositId] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [lastConfirmedDeposit, setLastConfirmedDeposit] = useState<DepositItem | null>(null);
+  const [lastSubmittedDeposit, setLastSubmittedDeposit] = useState<DepositItem | null>(null);
+  
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const loadData = async () => {
     try {
@@ -56,22 +69,77 @@ export const DepositView: React.FC<DepositViewProps> = ({ onDepositConfirmed }) 
     setTimeout(() => setCopied(false), 2500);
   };
 
-  const handleGenerateTestTx = async () => {
-    try {
-      const res = await api.getMockTxHash();
-      setTxHash(res.txHash);
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (!file.type.startsWith('image/')) {
+      setErrorMessage('Please select a valid image file (PNG, JPG, JPEG, WEBP).');
+      return;
+    }
+
+    if (file.size > 5 * 1024 * 1024) {
+      setErrorMessage('Image size is too large. Please select an image under 5MB.');
+      return;
+    }
+
+    setProofFileName(file.name);
+    const reader = new FileReader();
+    reader.onload = () => {
+      setProofPhotoUrl(reader.result as string);
       setErrorMessage(null);
-    } catch {
-      // Fallback local mock hash generator
-      const mock = '0x' + Array.from({ length: 64 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
-      setTxHash(mock);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleRemovePhoto = () => {
+    setProofPhotoUrl(null);
+    setProofFileName(null);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
     }
   };
 
-  const handleVerifyDeposit = async (e: React.FormEvent) => {
+  const handleReverifyDeposit = async (depId: string) => {
+    setVerifyingDepositId(depId);
+    setErrorMessage(null);
+    setSuccessMessage(null);
+    try {
+      const res = await api.verifyUserDeposit(depId);
+      if (res.success) {
+        if (res.deposit?.status === 'confirmed') {
+          setSuccessMessage(res.message || 'Deposit successfully verified on BNB Smart Chain and credited!');
+          onDepositConfirmed();
+        } else {
+          setSuccessMessage(res.message || `Current BSC confirmations: ${res.confirmations || 0}/${res.requiredConfirmations || 12}`);
+        }
+        await loadData();
+      } else {
+        setErrorMessage(res.error || 'Verification on BNB Smart Chain did not succeed.');
+      }
+    } catch (err: any) {
+      setErrorMessage(err?.message || 'Failed to query BNB Smart Chain RPC.');
+    } finally {
+      setVerifyingDepositId(null);
+    }
+  };
+
+  const handleSubmitDeposit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!txHash) {
-      setErrorMessage('Please enter the blockchain transaction hash.');
+    if (!txHash.trim()) {
+      setErrorMessage('Please provide the BNB Smart Chain Transaction Hash (TxID). This is required to verify and track your deposit.');
+      return;
+    }
+
+    const numAmount = parseFloat(amount);
+    const minDeposit = settings?.minimumDepositAmount || 300;
+    if (isNaN(numAmount) || numAmount <= 0) {
+      setErrorMessage('Please enter a valid deposit amount greater than 0 USDT.');
+      return;
+    }
+
+    if (numAmount < minDeposit) {
+      setErrorMessage(`Minimum deposit is ${minDeposit} USDT. Please enter an amount of ${minDeposit} USDT or more.`);
       return;
     }
 
@@ -82,18 +150,28 @@ export const DepositView: React.FC<DepositViewProps> = ({ onDepositConfirmed }) 
     try {
       const res = await api.submitDeposit({
         txHash: txHash.trim(),
-        amount: amount ? parseFloat(amount) : undefined,
+        amount: numAmount,
+        proofPhotoUrl: proofPhotoUrl || undefined,
+        userNotes: userNotes.trim() || undefined,
       });
 
       if (res.success && res.deposit) {
-        setSuccessMessage(`Deposit of $${res.deposit.amount} USDT successfully verified and credited!`);
-        setLastConfirmedDeposit(res.deposit);
+        const isConfirmed = res.deposit.status === 'confirmed';
+        const depAmt = Number(res.deposit.amount || 0);
+        setSuccessMessage(
+          isConfirmed
+            ? `Deposit of $${depAmt.toFixed(2)} USDT verified on BNB Smart Chain and credited to your account!`
+            : `Deposit of $${depAmt.toFixed(2)} USDT submitted. Awaiting BSC network confirmations (${res.deposit.confirmations || 0}/${res.deposit.requiredConfirmations || 12}).`
+        );
+        setLastSubmittedDeposit(res.deposit);
         setTxHash('');
+        setUserNotes('');
+        handleRemovePhoto();
         await loadData();
         onDepositConfirmed();
       }
     } catch (err) {
-      setErrorMessage((err as Error).message || 'Deposit verification failed. Please check the transaction hash.');
+      setErrorMessage((err as Error).message || 'Deposit submission failed. Please verify your details.');
     } finally {
       setIsSubmitting(false);
     }
@@ -104,37 +182,37 @@ export const DepositView: React.FC<DepositViewProps> = ({ onDepositConfirmed }) 
       {/* Title & Network Header */}
       <div>
         <div className="flex items-center space-x-2">
-          <h1 className="text-xl sm:text-2xl font-bold text-slate-100 dark:text-slate-100 text-slate-900">
+          <h1 className="text-xl sm:text-2xl font-extrabold text-slate-900 dark:text-white">
             Deposit USDT
           </h1>
-          <span className="px-2.5 py-0.5 text-xs font-bold bg-amber-500 text-slate-950 rounded-md">
-            BEP-20 ONLY
+          <span className="px-2.5 py-0.5 text-xs font-bold bg-blue-600 text-white rounded-md shadow-xs">
+            BEP-20 (BSC Mainnet)
           </span>
         </div>
-        <p className="text-xs text-slate-400 dark:text-slate-400 text-slate-500 mt-1">
-          Deposit USDT on the BNB Smart Chain network to start earning daily fund performance.
+        <p className="text-xs text-slate-600 dark:text-slate-400 mt-1">
+          Deposit USDT on the BNB Smart Chain network to start earning daily fund performance. Real-time RPC verified.
         </p>
       </div>
 
       {/* Critical Network Warning */}
-      <div className="p-4 rounded-2xl bg-amber-500/10 border border-amber-500/30 text-amber-300 flex items-start space-x-3 text-xs">
-        <AlertTriangle className="w-5 h-5 text-amber-400 flex-shrink-0 mt-0.5" />
+      <div className="p-4 rounded-2xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/60 text-amber-900 dark:text-amber-200 flex items-start space-x-3 text-xs shadow-xs">
+        <AlertTriangle className="w-5 h-5 text-amber-600 dark:text-amber-400 flex-shrink-0 mt-0.5" />
         <div className="space-y-1">
-          <p className="font-bold text-amber-200">Mandatory Network Notice</p>
-          <p className="text-amber-300/90 leading-relaxed">
+          <p className="font-bold text-amber-950 dark:text-amber-100">Mandatory Network Notice</p>
+          <p className="text-amber-900/90 dark:text-amber-200/90 leading-relaxed font-medium">
             Send <strong>USDT only through BNB Smart Chain (BEP-20)</strong>. Sending through ERC-20, TRC-20, Polygon, or other networks will result in irreversible loss of funds.
           </p>
         </div>
       </div>
 
       {/* Deposit QR & Address Box */}
-      <div className="rounded-3xl bg-slate-900/80 dark:bg-slate-900/80 bg-white border border-slate-800 dark:border-slate-800 border-slate-200 p-6 shadow-xl space-y-6">
+      <div className="rounded-3xl bg-white dark:bg-[#0F172A] border border-slate-200 dark:border-slate-800 p-6 sm:p-7 shadow-xl shadow-slate-200/50 dark:shadow-none space-y-6">
         <div className="flex flex-col sm:flex-row items-center gap-6">
           {/* QR Code */}
-          <div className="p-3 bg-white rounded-2xl shadow-inner border border-slate-200 flex-shrink-0">
+          <div className="p-3.5 bg-white rounded-2xl shadow-md border border-slate-200 flex-shrink-0">
             <QRCodeSVG
               value={depositAddress}
-              size={140}
+              size={135}
               level="H"
               includeMargin={false}
             />
@@ -143,118 +221,257 @@ export const DepositView: React.FC<DepositViewProps> = ({ onDepositConfirmed }) 
           {/* Address Details & Copy */}
           <div className="flex-1 space-y-3 w-full text-center sm:text-left">
             <div>
-              <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+              <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
                 Official BEP-20 Deposit Wallet
               </span>
-              <div className="mt-1 p-3 rounded-xl bg-slate-950 dark:bg-slate-950 bg-slate-100 border border-slate-800 dark:border-slate-800 border-slate-300 break-all font-mono text-xs font-semibold text-emerald-400 dark:text-emerald-400 text-emerald-700">
+              <div className="mt-1.5 p-3 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 break-all font-mono text-xs font-bold text-blue-700 dark:text-blue-400">
                 {depositAddress}
               </div>
             </div>
 
-            <div className="flex items-center justify-center sm:justify-start gap-2">
+            <div className="flex flex-wrap items-center justify-center sm:justify-start gap-3">
               <button
                 type="button"
                 onClick={handleCopy}
-                className="flex items-center space-x-2 py-2 px-4 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs shadow-md transition active:scale-95"
+                className="flex items-center space-x-2 py-2.5 px-4 rounded-xl bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-bold text-xs shadow-md shadow-blue-500/25 transition active:scale-95 cursor-pointer"
               >
                 {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
                 <span>{copied ? 'Address Copied!' : 'Copy Deposit Address'}</span>
               </button>
 
-              <span className="text-[11px] text-slate-400">
-                Min. confirmations: {settings?.requiredConfirmations || 12} blocks
-              </span>
+              <a
+                href={`https://bscscan.com/address/${depositAddress}`}
+                target="_blank"
+                rel="noreferrer"
+                className="flex items-center space-x-1.5 py-2.5 px-3.5 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-semibold text-xs transition cursor-pointer"
+              >
+                <span>View Wallet on BscScan</span>
+                <ExternalLink className="w-3.5 h-3.5 text-slate-500" />
+              </a>
             </div>
           </div>
         </div>
 
         {/* 3 Steps Guidance */}
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-2 border-t border-slate-800 dark:border-slate-800 border-slate-200 text-xs">
-          <div className="p-2.5 rounded-xl bg-slate-950/40 border border-slate-800/60">
-            <span className="text-emerald-400 font-bold">1. Transfer USDT</span>
-            <p className="text-slate-400 text-[11px] mt-0.5">Send BEP-20 USDT from your wallet (Trust Wallet, Binance, etc.)</p>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-3 border-t border-slate-100 dark:border-slate-800 text-xs">
+          <div className="p-3.5 rounded-2xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+            <span className="text-blue-600 dark:text-blue-400 font-bold block text-sm">1. Transfer USDT</span>
+            <p className="text-slate-600 dark:text-slate-400 text-xs mt-1 leading-relaxed">
+              Send BEP-20 USDT from your wallet (Binance, Trust Wallet, MetaMask, OKX, etc.)
+            </p>
           </div>
-          <div className="p-2.5 rounded-xl bg-slate-950/40 border border-slate-800/60">
-            <span className="text-emerald-400 font-bold">2. Paste Tx Hash</span>
-            <p className="text-slate-400 text-[11px] mt-0.5">Copy transaction hash from your wallet and paste below</p>
+          <div className="p-3.5 rounded-2xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+            <span className="text-blue-600 dark:text-blue-400 font-bold block text-sm">2. Enter TxID & Receipt</span>
+            <p className="text-slate-600 dark:text-slate-400 text-xs mt-1 leading-relaxed">
+              Paste your BNB Smart Chain transaction hash for automated node verification
+            </p>
           </div>
-          <div className="p-2.5 rounded-xl bg-slate-950/40 border border-slate-800/60">
-            <span className="text-emerald-400 font-bold">3. Instant Credit</span>
-            <p className="text-slate-400 text-[11px] mt-0.5">Backend verifies on BSC and allocates balance immediately</p>
+          <div className="p-3.5 rounded-2xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+            <span className="text-blue-600 dark:text-blue-400 font-bold block text-sm">3. Real On-Chain Credit</span>
+            <p className="text-slate-600 dark:text-slate-400 text-xs mt-1 leading-relaxed">
+              Verified on BSC and automatically credited to your principal balance
+            </p>
           </div>
         </div>
       </div>
 
-      {/* Deposit Verification Form */}
-      <div className="rounded-3xl bg-slate-900/80 dark:bg-slate-900/80 bg-white border border-slate-800 dark:border-slate-800 border-slate-200 p-6 shadow-xl space-y-4">
-        <div className="flex items-center justify-between">
-          <h2 className="text-sm font-bold uppercase tracking-wider text-slate-300 dark:text-slate-300 text-slate-800 flex items-center space-x-2">
-            <ShieldCheck className="w-4 h-4 text-emerald-400" />
-            <span>Verify Blockchain Transaction</span>
+      {/* Deposit Confirmation Form */}
+      <div className="rounded-3xl bg-white dark:bg-[#0F172A] border border-slate-200 dark:border-slate-800 p-6 sm:p-7 shadow-xl shadow-slate-200/50 dark:shadow-none space-y-5">
+        <div className="flex items-center justify-between border-b border-slate-100 dark:border-slate-800 pb-3.5">
+          <h2 className="text-sm font-bold uppercase tracking-wider text-slate-800 dark:text-slate-200 flex items-center space-x-2">
+            <ShieldCheck className="w-4 h-4 text-blue-600 dark:text-blue-400" />
+            <span>Deposit Verification & Registration</span>
           </h2>
-          <button
-            type="button"
-            onClick={handleGenerateTestTx}
-            className="flex items-center space-x-1 px-2.5 py-1 rounded-lg text-[11px] font-semibold bg-purple-500/10 text-purple-400 hover:bg-purple-500/20 border border-purple-500/30 transition"
-          >
-            <Sparkles className="w-3.5 h-3.5" />
-            <span>Fill Demo Tx Hash</span>
-          </button>
+          <span className="text-[11px] font-semibold text-slate-500 dark:text-slate-400">
+            BSC Mainnet RPC
+          </span>
         </div>
 
         {errorMessage && (
-          <div className="p-3.5 rounded-xl bg-red-500/10 border border-red-500/20 text-red-300 text-xs flex items-center space-x-2">
-            <XCircle className="w-4 h-4 flex-shrink-0 text-red-400" />
+          <div className="p-3.5 rounded-xl bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800/60 text-red-700 dark:text-red-300 text-xs flex items-center space-x-2 font-medium">
+            <XCircle className="w-4 h-4 flex-shrink-0 text-red-500" />
             <span>{errorMessage}</span>
           </div>
         )}
 
         {successMessage && (
-          <div className="p-3.5 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 text-xs flex items-center space-x-2">
-            <CheckCircle2 className="w-4 h-4 flex-shrink-0 text-emerald-400" />
+          <div className="p-3.5 rounded-xl bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800/60 text-blue-700 dark:text-blue-300 text-xs flex items-center space-x-2 font-medium">
+            <CheckCircle2 className="w-4 h-4 flex-shrink-0 text-blue-500" />
             <span>{successMessage}</span>
           </div>
         )}
 
-        <form onSubmit={handleVerifyDeposit} className="space-y-4 text-xs">
+        <form onSubmit={handleSubmitDeposit} className="space-y-4 text-xs">
           <div>
-            <label className="block font-semibold text-slate-300 dark:text-slate-300 text-slate-700 mb-1">
-              Deposit Amount (USDT)
-            </label>
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="block font-semibold text-slate-700 dark:text-slate-300">
+                Deposit Amount (USDT) <span className="text-red-500">*</span>
+              </label>
+              <span className="text-[11px] font-bold text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-950/60 px-2 py-0.5 rounded-md border border-blue-200 dark:border-blue-800">
+                Minimum: {settings?.minimumDepositAmount || 300} USDT
+              </span>
+            </div>
             <div className="relative">
               <input
                 type="number"
                 step="any"
-                min="10"
+                min={settings?.minimumDepositAmount || 300}
+                required
                 value={amount}
                 onChange={e => setAmount(e.target.value)}
-                placeholder="100"
-                className="w-full py-2.5 px-3 rounded-xl bg-slate-950 dark:bg-slate-950 bg-slate-100 border border-slate-800 dark:border-slate-800 border-slate-300 text-slate-100 dark:text-slate-100 text-slate-900 font-semibold focus:outline-none focus:border-emerald-500"
+                placeholder="300"
+                className="w-full py-3 px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white font-semibold text-sm focus:outline-none focus:border-blue-600 dark:focus:border-blue-500 focus:bg-white dark:focus:bg-slate-950 transition"
               />
-              <span className="absolute right-3 top-2.5 font-bold text-slate-500">USDT</span>
+              <span className="absolute right-3.5 top-3 font-bold text-slate-400">USDT</span>
+            </div>
+            {/* Quick preset amount buttons */}
+            <div className="flex flex-wrap gap-2 mt-2">
+              {[300, 500, 1000, 2500, 5000].map(val => (
+                <button
+                  key={val}
+                  type="button"
+                  onClick={() => setAmount(val.toString())}
+                  className={`py-1 px-2.5 rounded-lg text-xs font-semibold transition cursor-pointer border ${
+                    amount === val.toString()
+                      ? 'bg-blue-600 text-white border-blue-600 shadow-xs'
+                      : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 border-slate-200 dark:border-slate-700 hover:bg-slate-200 dark:hover:bg-slate-700'
+                  }`}
+                >
+                  ${val.toLocaleString()}
+                </button>
+              ))}
             </div>
           </div>
 
+          {/* Payment Proof Photo Upload */}
           <div>
-            <label className="block font-semibold text-slate-300 dark:text-slate-300 text-slate-700 mb-1">
-              BNB Smart Chain Transaction Hash (TxID)
+            <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
+              Upload Payment Proof / Screenshot (Optional Receipt)
+            </label>
+
+            {!proofPhotoUrl ? (
+              <div
+                onClick={() => fileInputRef.current?.click()}
+                className="border-2 border-dashed border-slate-300 dark:border-slate-700 hover:border-blue-500 dark:hover:border-blue-500 rounded-2xl p-6 text-center bg-slate-50 dark:bg-slate-900/50 transition cursor-pointer hover:bg-blue-50/30 dark:hover:bg-blue-950/20"
+              >
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/*"
+                  onChange={handleFileChange}
+                  className="hidden"
+                />
+                <div className="flex flex-col items-center justify-center space-y-2">
+                  <div className="w-10 h-10 rounded-xl bg-blue-100 dark:bg-blue-900/50 text-blue-600 dark:text-blue-400 flex items-center justify-center">
+                    <Upload className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <p className="font-bold text-slate-800 dark:text-slate-200 text-xs">
+                      Click to upload transfer screenshot or receipt photo
+                    </p>
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
+                      Supports PNG, JPG, JPEG, WEBP (Max 5MB)
+                    </p>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="p-3.5 rounded-2xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 flex items-center justify-between">
+                <div className="flex items-center space-x-3">
+                  <div className="relative group cursor-pointer" onClick={() => setPreviewModalImage(proofPhotoUrl)}>
+                    <img
+                      src={proofPhotoUrl}
+                      alt="Payment Proof"
+                      className="w-14 h-14 object-cover rounded-xl border border-slate-200 dark:border-slate-700 shadow-xs"
+                    />
+                    <div className="absolute inset-0 bg-black/40 rounded-xl flex items-center justify-center opacity-0 group-hover:opacity-100 transition">
+                      <Eye className="w-4 h-4 text-white" />
+                    </div>
+                  </div>
+                  <div>
+                    <p className="font-bold text-slate-900 dark:text-white text-xs truncate max-w-xs">
+                      {proofFileName || 'Transfer Receipt Screenshot'}
+                    </p>
+                    <p className="text-[11px] text-blue-600 dark:text-blue-400 font-semibold mt-0.5 flex items-center space-x-1">
+                      <FileCheck className="w-3.5 h-3.5" />
+                      <span>Proof attached ready for submission</span>
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex items-center space-x-2">
+                  <button
+                    type="button"
+                    onClick={() => setPreviewModalImage(proofPhotoUrl)}
+                    className="p-2 rounded-xl bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 transition cursor-pointer"
+                    title="View Full Screenshot"
+                  >
+                    <Eye className="w-4 h-4" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleRemovePhoto}
+                    className="p-2 rounded-xl bg-rose-50 dark:bg-rose-950/40 hover:bg-rose-100 dark:hover:bg-rose-900/50 text-rose-600 dark:text-rose-400 transition cursor-pointer"
+                    title="Remove Photo"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Transaction Hash */}
+          <div>
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="font-semibold text-slate-700 dark:text-slate-300">
+                BNB Smart Chain Transaction Hash (TxID) <span className="text-rose-500 font-bold">*Required</span>
+              </label>
+              <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                Found in your wallet or exchange withdrawal history
+              </span>
+            </div>
+            <input
+              type="text"
+              required
+              value={txHash}
+              onChange={e => setTxHash(e.target.value)}
+              placeholder="0x... (66-character BEP-20 transaction hash)"
+              className="w-full py-3 px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white font-mono text-xs focus:outline-none focus:border-blue-600 dark:focus:border-blue-500 focus:bg-white dark:focus:bg-slate-950 transition"
+            />
+            {txHash && (
+              <div className="mt-1.5 flex items-center space-x-1 text-[11px] text-blue-600 dark:text-blue-400">
+                <ExternalLink className="w-3 h-3" />
+                <a
+                  href={`https://bscscan.com/tx/${txHash.trim()}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="hover:underline font-mono truncate"
+                >
+                  Track on BSCScan: https://bscscan.com/tx/{txHash.trim().substring(0, 16)}...
+                </a>
+              </div>
+            )}
+          </div>
+
+          {/* User Notes */}
+          <div>
+            <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1.5">
+              Sender Wallet / Notes <span className="text-slate-400 font-normal">(Optional)</span>
             </label>
             <input
               type="text"
-              value={txHash}
-              onChange={e => setTxHash(e.target.value)}
-              placeholder="0x..."
-              className="w-full py-2.5 px-3 rounded-xl bg-slate-950 dark:bg-slate-950 bg-slate-100 border border-slate-800 dark:border-slate-800 border-slate-300 text-slate-100 dark:text-slate-100 text-slate-900 font-mono text-xs focus:outline-none focus:border-emerald-500"
+              value={userNotes}
+              onChange={e => setUserNotes(e.target.value)}
+              placeholder="e.g. Sent from Trust Wallet / Binance"
+              className="w-full py-2.5 px-3.5 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white text-xs focus:outline-none focus:border-blue-600 dark:focus:border-blue-500 focus:bg-white dark:focus:bg-slate-950 transition"
             />
-            <p className="text-[11px] text-slate-500 mt-1">
-              Example: 0x8f3c7e492211c54a9d76e492211c54a971c5a8c0b26d19543e49e29547d6e492
-            </p>
           </div>
 
           <button
             type="submit"
-            disabled={isSubmitting || !txHash}
-            className="w-full py-3 px-4 rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold text-sm shadow-lg shadow-emerald-500/20 transition flex items-center justify-center space-x-2"
+            disabled={isSubmitting || !txHash.trim() || !amount}
+            className="w-full py-3.5 px-4 rounded-xl bg-blue-600 hover:bg-blue-700 active:bg-blue-800 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold text-sm shadow-lg shadow-blue-500/25 transition flex items-center justify-center space-x-2 cursor-pointer"
           >
             {isSubmitting ? (
               <>
@@ -264,102 +481,296 @@ export const DepositView: React.FC<DepositViewProps> = ({ onDepositConfirmed }) 
             ) : (
               <>
                 <ArrowDownToLine className="w-4 h-4" />
-                <span>Verify & Credit Deposit</span>
+                <span>Submit & Verify on BNB Smart Chain</span>
               </>
             )}
           </button>
         </form>
       </div>
 
-      {/* Last Confirmed Deposit Details Receipt */}
-      {lastConfirmedDeposit && (
-        <div className="rounded-3xl bg-emerald-950/40 border border-emerald-500/40 p-5 shadow-lg space-y-3 text-xs">
-          <div className="flex items-center space-x-2 text-emerald-400 font-bold text-sm">
-            <CheckCircle2 className="w-4 h-4" />
-            <span>Deposit Confirmed Successfully</span>
+      {/* Last Submitted Deposit Details Receipt */}
+      {lastSubmittedDeposit && (
+        <div className="rounded-3xl bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800/60 p-5 shadow-lg space-y-3 text-xs">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center space-x-2 text-blue-700 dark:text-blue-400 font-bold text-sm">
+              <CheckCircle2 className="w-4 h-4" />
+              <span>
+                {lastSubmittedDeposit.status === 'confirmed' ? 'Deposit Confirmed & Credited' : 'Deposit Registered on BSC'}
+              </span>
+            </div>
+            <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase bg-blue-600 text-white">
+              {lastSubmittedDeposit.status}
+            </span>
           </div>
 
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1 text-slate-300">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1 text-slate-700 dark:text-slate-300">
             <div>
-              <p className="text-[10px] text-slate-400 uppercase">Amount</p>
-              <p className="font-bold text-emerald-400">${lastConfirmedDeposit.amount.toFixed(2)} USDT</p>
+              <p className="text-[10px] text-slate-500 dark:text-slate-400 uppercase font-bold">Amount</p>
+              <p className="font-bold text-blue-600 dark:text-blue-400 text-sm">${Number(lastSubmittedDeposit.amount || 0).toFixed(2)} USDT</p>
             </div>
             <div>
-              <p className="text-[10px] text-slate-400 uppercase">Network</p>
-              <p className="font-semibold">BEP-20 (BSC)</p>
+              <p className="text-[10px] text-slate-500 dark:text-slate-400 uppercase font-bold">Network</p>
+              <p className="font-semibold text-slate-800 dark:text-slate-200">BEP-20 (BSC)</p>
             </div>
             <div>
-              <p className="text-[10px] text-slate-400 uppercase">Confirmations</p>
-              <p className="font-semibold text-emerald-400">{lastConfirmedDeposit.confirmations} Blocks</p>
+              <p className="text-[10px] text-slate-500 dark:text-slate-400 uppercase font-bold">Confirmations</p>
+              <p className="font-semibold text-blue-600 dark:text-blue-400">
+                {lastSubmittedDeposit.confirmations || 0} / {lastSubmittedDeposit.requiredConfirmations || 12}
+              </p>
             </div>
             <div>
-              <p className="text-[10px] text-slate-400 uppercase">First Earning Date</p>
-              <p className="font-semibold">
-                {lastConfirmedDeposit.eligibilityDate ? new Date(lastConfirmedDeposit.eligibilityDate).toLocaleDateString() : 'Next Server Day'}
+              <p className="text-[10px] text-slate-500 dark:text-slate-400 uppercase font-bold">First Earning Date</p>
+              <p className="font-semibold text-slate-800 dark:text-slate-200">
+                {lastSubmittedDeposit.eligibilityDate ? new Date(lastSubmittedDeposit.eligibilityDate).toLocaleDateString() : 'Next Server Day'}
               </p>
             </div>
           </div>
 
-          <div className="text-[11px] text-slate-400 truncate break-all pt-1 border-t border-emerald-500/20 font-mono">
-            TxHash: {lastConfirmedDeposit.txHash}
+          <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-blue-200 dark:border-blue-800">
+            {lastSubmittedDeposit.txHash && (
+              <span className="text-[11px] text-slate-600 dark:text-slate-400 font-mono truncate max-w-sm">
+                TxHash: {lastSubmittedDeposit.txHash}
+              </span>
+            )}
+            
+            <div className="flex items-center space-x-2">
+              {lastSubmittedDeposit.txHash && (
+                <a
+                  href={`https://bscscan.com/tx/${lastSubmittedDeposit.txHash}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="flex items-center space-x-1 py-1 px-2.5 rounded-lg bg-blue-600 text-white font-bold text-[11px] hover:bg-blue-700 transition"
+                >
+                  <span>Track on BscScan</span>
+                  <ExternalLink className="w-3 h-3" />
+                </a>
+              )}
+              {lastSubmittedDeposit.proofPhotoUrl && (
+                <button
+                  type="button"
+                  onClick={() => setPreviewModalImage(lastSubmittedDeposit.proofPhotoUrl!)}
+                  className="flex items-center space-x-1 py-1 px-2.5 rounded-lg bg-white dark:bg-slate-900 border border-blue-300 dark:border-blue-700 text-blue-700 dark:text-blue-300 font-bold text-[11px] hover:bg-blue-50 dark:hover:bg-slate-800 transition cursor-pointer"
+                >
+                  <ImageIcon className="w-3 h-3" />
+                  <span>View Proof Photo</span>
+                </button>
+              )}
+            </div>
           </div>
         </div>
       )}
 
       {/* Past Deposit History */}
       <div className="space-y-3">
-        <h2 className="text-sm font-bold uppercase tracking-wider text-slate-400 dark:text-slate-400 text-slate-500">
-          Deposit History
-        </h2>
+        <div className="flex items-center justify-between">
+          <h2 className="text-sm font-bold uppercase tracking-wider text-slate-700 dark:text-slate-300">
+            Your Deposit History & BSC Tracking
+          </h2>
+          <button
+            type="button"
+            onClick={loadData}
+            className="flex items-center space-x-1 text-xs text-blue-600 dark:text-blue-400 hover:underline font-semibold cursor-pointer"
+          >
+            <RefreshCw className="w-3 h-3" />
+            <span>Refresh</span>
+          </button>
+        </div>
 
         {deposits.length === 0 ? (
-          <div className="p-8 text-center rounded-2xl bg-slate-900/40 border border-slate-800 text-slate-400 text-xs">
-            No deposits found.
+          <div className="p-8 text-center rounded-2xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-slate-500 dark:text-slate-400 text-xs">
+            No deposit records found yet.
           </div>
         ) : (
-          <div className="space-y-2">
-            {deposits.map(dep => (
-              <div
-                key={dep.id}
-                className="p-3.5 rounded-2xl bg-slate-900/60 dark:bg-slate-900/60 bg-white border border-slate-800/70 dark:border-slate-800/70 border-slate-200 flex items-center justify-between text-xs"
-              >
-                <div className="space-y-1">
-                  <div className="flex items-center space-x-2">
-                    <span className="font-bold text-sm text-slate-100 dark:text-slate-100 text-slate-900">
-                      +${dep.amount.toFixed(2)} USDT
-                    </span>
-                    <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
-                      {dep.status.toUpperCase()}
-                    </span>
-                  </div>
-                  <p className="text-[11px] text-slate-400 font-mono truncate max-w-xs sm:max-w-md">
-                    Tx: {dep.txHash.substring(0, 10)}...{dep.txHash.slice(-8)}
-                  </p>
-                  <p className="text-[10px] text-slate-500">
-                    {new Date(dep.createdAt).toLocaleString()} • {dep.confirmations} Confirmations
-                  </p>
-                </div>
+          <div className="space-y-3">
+            {deposits.map(dep => {
+              const isConfirmed = dep.status === 'confirmed';
+              const isPending = dep.status === 'pending' || dep.status === 'confirming';
+              const isRejected = dep.status === 'rejected';
+              const isVerifying = verifyingDepositId === dep.id;
 
-                <div className="text-right text-[11px]">
-                  <p className="text-slate-400">Lock Expiry:</p>
-                  <p className="font-medium text-slate-300">
-                    {dep.depositLockEndDate ? new Date(dep.depositLockEndDate).toLocaleDateString() : '20 Days'}
-                  </p>
+              return (
+                <div
+                  key={dep.id}
+                  className="p-4 sm:p-5 rounded-2xl bg-white dark:bg-[#0F172A] border border-slate-200 dark:border-slate-800 space-y-3 text-xs shadow-xs"
+                >
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <div className="flex items-center space-x-3">
+                      {dep.proofPhotoUrl ? (
+                        <div
+                          className="relative group cursor-pointer flex-shrink-0"
+                          onClick={() => setPreviewModalImage(dep.proofPhotoUrl!)}
+                        >
+                          <img
+                            src={dep.proofPhotoUrl}
+                            alt="Receipt"
+                            className="w-12 h-12 object-cover rounded-xl border border-slate-200 dark:border-slate-700 shadow-xs"
+                          />
+                          <div className="absolute inset-0 bg-black/40 rounded-xl flex items-center justify-center opacity-0 group-hover:opacity-100 transition">
+                            <Eye className="w-3.5 h-3.5 text-white" />
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="w-12 h-12 rounded-xl bg-blue-50 dark:bg-blue-950/50 text-blue-600 dark:text-blue-400 flex items-center justify-center font-bold flex-shrink-0">
+                          <ArrowDownToLine className="w-6 h-6" />
+                        </div>
+                      )}
+
+                      <div className="space-y-0.5">
+                        <div className="flex items-center space-x-2">
+                          <span className="font-extrabold text-base text-slate-900 dark:text-white">
+                            +${Number(dep.amount || 0).toFixed(2)} USDT
+                          </span>
+                          <span
+                            className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold ${
+                              isConfirmed
+                                ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20'
+                                : isPending
+                                ? 'bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20'
+                                : 'bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/20'
+                            }`}
+                          >
+                            {dep.status.toUpperCase()}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                          {new Date(dep.createdAt).toLocaleString()} • BEP-20 (BSC)
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      {isPending && (
+                        <button
+                          type="button"
+                          onClick={() => handleReverifyDeposit(dep.id)}
+                          disabled={isVerifying}
+                          className="flex items-center space-x-1.5 py-1.5 px-3 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-bold text-[11px] transition shadow-xs cursor-pointer"
+                        >
+                          {isVerifying ? (
+                            <>
+                              <Loader2 className="w-3 h-3 animate-spin" />
+                              <span>Checking BSC...</span>
+                            </>
+                          ) : (
+                            <>
+                              <RefreshCw className="w-3 h-3" />
+                              <span>Re-verify on BSC</span>
+                            </>
+                          )}
+                        </button>
+                      )}
+                      {dep.txHash && (
+                        <a
+                          href={`https://bscscan.com/tx/${dep.txHash}`}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="flex items-center space-x-1 py-1.5 px-3 rounded-xl bg-blue-50 dark:bg-blue-950/50 hover:bg-blue-100 dark:hover:bg-blue-900/60 text-blue-700 dark:text-blue-300 font-bold text-[11px] border border-blue-200 dark:border-blue-800 transition cursor-pointer"
+                        >
+                          <span>Track on BscScan</span>
+                          <ExternalLink className="w-3 h-3" />
+                        </a>
+                      )}
+                      {dep.proofPhotoUrl && (
+                        <button
+                          type="button"
+                          onClick={() => setPreviewModalImage(dep.proofPhotoUrl!)}
+                          className="flex items-center space-x-1 py-1.5 px-3 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-semibold text-[11px] transition cursor-pointer"
+                        >
+                          <ImageIcon className="w-3 h-3" />
+                          <span>View Proof</span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="pt-2 border-t border-slate-100 dark:border-slate-800/80 flex flex-col sm:flex-row sm:items-center justify-between text-[11px] gap-1 text-slate-500 dark:text-slate-400">
+                    <div className="font-mono truncate max-w-sm flex items-center space-x-2">
+                      <span>TxID: {dep.txHash || 'Pending blockchain broadcast'}</span>
+                      {dep.blockNumber && (
+                        <span className="text-slate-400 flex items-center space-x-0.5">
+                          <Layers className="w-3 h-3 inline" />
+                          <span>Block #{dep.blockNumber}</span>
+                        </span>
+                      )}
+                    </div>
+                    <div>
+                      {isConfirmed ? (
+                        <span>
+                          Lock Expiry:{' '}
+                          <strong className="text-slate-800 dark:text-slate-200">
+                            {dep.depositLockEndDate ? new Date(dep.depositLockEndDate).toLocaleDateString() : '30 Days'}
+                          </strong>
+                        </span>
+                      ) : isPending ? (
+                        <span className="text-amber-600 dark:text-amber-400 font-medium flex items-center space-x-1">
+                          <Clock className="w-3 h-3" />
+                          <span>Confirmations: {dep.confirmations || 0} / {dep.requiredConfirmations || 12}</span>
+                        </span>
+                      ) : (
+                        <span className="text-rose-600 dark:text-rose-400">
+                          Rejected: {dep.adminNotes || 'Verification failed on BSC'}
+                        </span>
+                      )}
+                    </div>
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>
 
+      {/* Full Photo Modal Viewer */}
+      {previewModalImage && (
+        <div
+          className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={() => setPreviewModalImage(null)}
+        >
+          <div
+            className="relative max-w-2xl w-full bg-white dark:bg-slate-900 rounded-3xl p-4 shadow-2xl border border-slate-700 overflow-hidden"
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between pb-3 border-b border-slate-200 dark:border-slate-800 mb-3">
+              <h3 className="font-bold text-slate-900 dark:text-white text-sm flex items-center space-x-2">
+                <ImageIcon className="w-4 h-4 text-blue-600 dark:text-blue-400" />
+                <span>Payment Proof & Transfer Receipt</span>
+              </h3>
+              <button
+                type="button"
+                onClick={() => setPreviewModalImage(null)}
+                className="p-1.5 rounded-full hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-500 hover:text-slate-800 dark:hover:text-white transition cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="max-h-[75vh] overflow-auto flex items-center justify-center rounded-2xl bg-slate-950 p-2">
+              <img
+                src={previewModalImage}
+                alt="Full Payment Proof"
+                className="max-h-[70vh] w-auto object-contain rounded-xl"
+              />
+            </div>
+            <div className="pt-3 text-right">
+              <button
+                type="button"
+                onClick={() => setPreviewModalImage(null)}
+                className="py-2 px-5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs cursor-pointer"
+              >
+                Close Preview
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Risk Disclaimer in Short Font */}
-      <div className="p-4 rounded-2xl bg-red-950/20 dark:bg-red-950/20 bg-red-50/50 border border-red-500/20 text-slate-400 space-y-1.5 text-xs">
-        <div className="flex items-center space-x-1.5 text-red-400 font-semibold text-[11px]">
+      <div className="p-4 rounded-2xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-400 space-y-1.5 text-xs">
+        <div className="flex items-center space-x-1.5 text-amber-600 dark:text-amber-400 font-semibold text-[11px]">
           <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
           <span>Managed Fund Risk Disclosure</span>
         </div>
-        <p className="text-[10px] leading-relaxed text-slate-400 dark:text-slate-400 text-slate-600">
-          <strong>DISCLAIMER:</strong> Deposited funds are pooled and deployed into active algorithmic trading and digital asset liquidity strategies. Cryptocurrency trading involves market volatility and capital risk. Past returns and historical daily performance do not guarantee future earnings. Daily yield rates are variable based on net fund performance and are non-guaranteed. Newly deposited principal is subject to a 20-day liquidity stabilization lock. By submitting a deposit, you confirm acceptance of all governance rules.
+        <p className="text-[11px] leading-relaxed">
+          <strong>DISCLAIMER:</strong> Deposited funds are pooled and deployed into active algorithmic trading and digital asset liquidity strategies. Cryptocurrency trading involves market volatility and capital risk. Past returns and historical daily performance do not guarantee future earnings. Daily yield rates are variable based on net fund performance and are non-guaranteed. Newly deposited principal is subject to a 30-day liquidity stabilization lock. By submitting a deposit, you confirm acceptance of all governance rules.
         </p>
       </div>
     </div>

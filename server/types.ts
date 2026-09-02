@@ -19,6 +19,11 @@ export interface User {
   lastLoginAt?: string;
   loginAttempts: number;
   lockUntil?: string;
+  fundLockUntil?: string; // ISO string for active 30-day fund lock
+  fundLockReason?: string;
+  lastWithdrawalAt?: string;
+  walletAddress?: string;
+  isLocked?: boolean;
 }
 
 export type DepositStatus = 'pending' | 'confirming' | 'confirmed' | 'rejected';
@@ -27,18 +32,27 @@ export interface Deposit {
   id: string;
   userId: string;
   amount: number;
+  actualAmount?: number;
   currency: 'USDT';
   network: 'BEP-20';
   txHash: string;
   fromAddress?: string;
   toAddress: string;
+  tokenContract?: string;
+  blockNumber?: number;
   status: DepositStatus;
   confirmations: number;
   requiredConfirmations: number;
   createdAt: string;
   confirmedAt?: string;
+  verifiedAt?: string;
   eligibilityDate?: string; // Eligible for performance earnings (next server day)
-  depositLockEndDate?: string; // 20 days lock period for withdrawal
+  depositLockEndDate?: string; // 30 days lock period for withdrawal
+  proofPhotoUrl?: string; // Uploaded payment proof screenshot / photo data URL
+  userNotes?: string;
+  adminNotes?: string;
+  reviewedAt?: string;
+  reviewedBy?: string;
   notes?: string;
 }
 
@@ -49,7 +63,7 @@ export interface Withdrawal {
   reference: string;
   userId: string;
   requestedAmount: number;
-  feePercentage: number; // Fixed 4%
+  feePercentage: number; // Configurable / Default 6%
   feeAmount: number;
   netAmount: number;
   destinationAddress: string;
@@ -69,13 +83,14 @@ export interface DailyPerformance {
   id: string;
   date: string; // YYYY-MM-DD
   overallFundAmount: number;
-  actualFundPerformance: number; // percentage
-  applicableRate: number; // e.g. 0.005 for 0.50%
+  actualFundPerformance: number; // percentage (e.g. 1.25, -0.5, 0)
+  applicableRate: number; // e.g. 0.01 for 1%, -0.005 for -0.5%, 0 for 0%
   notes: string;
   createdBy: string;
   createdAt: string;
   appliedCount: number;
   totalDistributed: number;
+  marketCondition?: 'profit' | 'loss' | 'neutral';
 }
 
 export interface EarningEntry {
@@ -84,16 +99,19 @@ export interface EarningEntry {
   depositId?: string;
   calculationId: string;
   baseEligibleAmount: number;
-  applicableRate: number; // e.g. 0.005
-  earningsAmount: number;
+  applicableRate: number; // e.g. 0.005, -0.005, 0
+  earningsAmount: number; // positive, negative, or 0
   performanceDate: string; // YYYY-MM-DD
   createdAt: string;
   status: 'credited' | 'reversed';
+  marketCondition?: 'profit' | 'loss' | 'neutral';
+  note?: string;
 }
 
 export type LedgerType = 
   | 'deposit' 
   | 'daily_earnings' 
+  | 'daily_loss'
   | 'withdrawal_request' 
   | 'withdrawal_fee' 
   | 'withdrawal_paid' 
@@ -128,6 +146,11 @@ export interface UserBalanceSummary {
   canWithdraw: boolean;
   withdrawalRestrictionReason?: string;
   withdrawalEligibleDate: string;
+  isFundLocked: boolean;
+  fundLockUntil?: string;
+  fundLockRemainingDays: number;
+  fundLockRemainingHours: number;
+  fundLockReason?: string;
 }
 
 export interface AuditLog {
@@ -149,13 +172,20 @@ export interface AppSettings {
   bep20DepositAddress: string;
   usdtContractAddress: string;
   requiredConfirmations: number;
-  withdrawalFeePercentage: number; // 4
+  minimumDepositAmount: number; // 300 USDT
+  withdrawalFeePercentage: number; // Configurable / Default 6%
   accountAgeRequirementDays: number; // 30
-  depositLockPeriodDays: number; // 20
+  depositLockPeriodDays: number; // 30
   telegramSupportUrl: string;
   operationalWalletAddress: string;
   compoundingEnabled: boolean;
   maintenanceMode: boolean;
+  registrationEnabled: boolean;
+  loginEnabled: boolean;
+  sessionVersion: number;
+  systemLogRetentionDays: number;
+  errorLogRetentionDays: number;
+  notificationRetentionDays: number;
 }
 
 export interface MarketPrice {

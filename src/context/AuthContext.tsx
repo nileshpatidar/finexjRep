@@ -1,6 +1,6 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import { UserProfile } from '../types';
-import { api, setAuthToken } from '../services/api';
+import { api } from '../services/api';
 
 interface AuthContextType {
   user: UserProfile | null;
@@ -12,14 +12,12 @@ interface AuthContextType {
   logout: () => Promise<void>;
   logoutAll: () => Promise<void>;
   refreshUser: () => Promise<void>;
-  switchDemoAccount: (accountType: 'demo' | 'newuser' | 'admin') => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [user, setUser] = useState<UserProfile | null>(null);
-  const [token, setToken] = useState<string | null>(localStorage.getItem('usdt_auth_token'));
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isOffline, setIsOffline] = useState<boolean>(!navigator.onLine);
 
@@ -36,64 +34,27 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     };
   }, []);
 
-  const refreshUser = async () => {
-    const savedToken = localStorage.getItem('usdt_auth_token');
-    if (!savedToken) {
-      setUser(null);
-      setIsLoading(false);
-      return;
-    }
-
+  const refreshUser = useCallback(async () => {
     try {
       const res = await api.getMe();
       setUser(res.user);
     } catch (err) {
-      console.warn('Could not refresh session:', err);
-      // If unauthorized, clear token
-      if (!isOffline && (err as Error).message?.includes('expired')) {
-        setAuthToken(null);
-        setToken(null);
-        setUser(null);
-      }
+      setUser(null);
     } finally {
       setIsLoading(false);
     }
-  };
+  }, []);
 
   useEffect(() => {
-    // Initial auto-login to demo user if no token present for seamless preview experience
-    const initializeAuth = async () => {
-      const savedToken = localStorage.getItem('usdt_auth_token');
-      if (savedToken) {
-        await refreshUser();
-      } else {
-        // Auto-login to standard demo user for immediate working demo
-        try {
-          const res = await api.login({ email: 'demo@usdtfund.com', password: 'UserPass123!' });
-          if (res.token && res.user) {
-            setAuthToken(res.token);
-            setToken(res.token);
-            setUser(res.user);
-          }
-        } catch {
-          // If server not yet running or offline
-        } finally {
-          setIsLoading(false);
-        }
-      }
-    };
-
-    initializeAuth();
-  }, []);
+    refreshUser();
+  }, [refreshUser]);
 
   const login = async (email: string, pass: string, code?: string) => {
     const res = await api.login({ email, password: pass, twoFactorCode: code });
     if (res.require2FA) {
       return res;
     }
-    if (res.token && res.user) {
-      setAuthToken(res.token);
-      setToken(res.token);
+    if (res.user) {
       setUser(res.user);
     }
     return res;
@@ -101,9 +62,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const register = async (data: any) => {
     const res = await api.register(data);
-    if (res.token && res.user) {
-      setAuthToken(res.token);
-      setToken(res.token);
+    if (res.user) {
       setUser(res.user);
     }
   };
@@ -114,8 +73,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } catch {
       // Ignore
     }
-    setAuthToken(null);
-    setToken(null);
     setUser(null);
   };
 
@@ -125,41 +82,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } catch {
       // Ignore
     }
-    setAuthToken(null);
-    setToken(null);
     setUser(null);
-  };
-
-  const switchDemoAccount = async (accountType: 'demo' | 'newuser' | 'admin') => {
-    setIsLoading(true);
-    let email = 'demo@usdtfund.com';
-    let pass = 'UserPass123!';
-
-    if (accountType === 'newuser') {
-      email = 'newuser@usdtfund.com';
-      pass = 'UserPass123!';
-    } else if (accountType === 'admin') {
-      email = 'admin@usdtfund.com';
-      pass = 'AdminPass123!';
-    }
-
-    try {
-      const res = await api.login({ email, password: pass });
-      if (res.token && res.user) {
-        setAuthToken(res.token);
-        setToken(res.token);
-        setUser(res.user);
-      }
-    } finally {
-      setIsLoading(false);
-    }
   };
 
   return (
     <AuthContext.Provider
       value={{
         user,
-        token,
+        token: user ? 'cookie_session' : null,
         isLoading,
         isOffline,
         login,
@@ -167,7 +97,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         logout,
         logoutAll,
         refreshUser,
-        switchDemoAccount,
       }}
     >
       {children}
@@ -182,3 +111,4 @@ export const useAuth = () => {
   }
   return context;
 };
+

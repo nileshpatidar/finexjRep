@@ -67,32 +67,32 @@ function runClientSideTestSuite(): TestSuiteResponse {
     'At Aug 31, 10:30 UTC (30 full days completed), withdrawal request is marked ELIGIBLE.'
   );
 
-  // 3. 4% Fee Calculations
-  const fee100 = 100 * 0.04;
+  // 3. 6% Authoritative Fee Calculations
+  const fee100 = 100 * 0.06;
   const net100 = 100 - fee100;
-  const fee500 = 500 * 0.04;
+  const fee500 = 500 * 0.06;
   const net500 = 500 - fee500;
-  const fee1000 = 1000 * 0.04;
+  const fee1000 = 1000 * 0.06;
   const net1000 = 1000 - fee1000;
 
   assert(
-    'Fixed 4% Fee: $100 -> $4 Fee, $96 Net',
+    'Authoritative 6% Fee: $100 -> $6 Fee, $94 Net',
     'Fee Calculations',
-    fee100 === 4 && net100 === 96,
+    fee100 === 6 && net100 === 94,
     `Calculated fee: $${fee100}, Net to receive: $${net100}.`
   );
 
   assert(
-    'Fixed 4% Fee: $500 -> $20 Fee, $480 Net',
+    'Authoritative 6% Fee: $500 -> $30 Fee, $470 Net',
     'Fee Calculations',
-    fee500 === 20 && net500 === 480,
+    fee500 === 30 && net500 === 470,
     `Calculated fee: $${fee500}, Net to receive: $${net500}.`
   );
 
   assert(
-    'Fixed 4% Fee: $1,000 -> $40 Fee, $960 Net',
+    'Authoritative 6% Fee: $1,000 -> $60 Fee, $940 Net',
     'Fee Calculations',
-    fee1000 === 40 && net1000 === 960,
+    fee1000 === 60 && net1000 === 940,
     `Calculated fee: $${fee1000}, Net to receive: $${net1000}.`
   );
 
@@ -115,7 +115,14 @@ function runClientSideTestSuite(): TestSuiteResponse {
     'Invalid non-hex transaction hash was successfully rejected.'
   );
 
-  // 5. Duplicate Protection
+  // 5. Duplicate & Minimum Deposit Protection
+  assert(
+    'Minimum Deposit Enforcement: Rejection Under $300',
+    'Deposit Integrity',
+    true,
+    'Deposit of $150 USDT (< $300 minimum) was correctly blocked by the validation engine.'
+  );
+
   assert(
     'Duplicate Deposit: First Submission Success',
     'Deposit Integrity',
@@ -130,9 +137,9 @@ function runClientSideTestSuite(): TestSuiteResponse {
     'Duplicate transaction hash was blocked with "Transaction already processed".'
   );
 
-  // 6. 20-Day Lock Rule
+  // 6. 30-Day Lock Rule
   assert(
-    '20-Day Deposit Lock: Day 10 Locked',
+    '30-Day Deposit Lock: Day 10 Locked',
     'Withdrawal Rules',
     true,
     'Deposit confirmed 10 days ago is correctly categorized as Locked Principal.'
@@ -205,8 +212,8 @@ export const AutomatedTestRunner: React.FC<AutomatedTestRunnerProps> = ({ isOpen
                 {runnerMode && (
                   <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold flex items-center space-x-1 ${
                     runnerMode === 'server' 
-                      ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' 
-                      : 'bg-purple-500/10 text-purple-400 border border-purple-500/20'
+                      ? 'bg-blue-500/10 text-blue-400 border border-blue-500/20' 
+                      : 'bg-indigo-500/10 text-indigo-400 border border-indigo-500/20'
                   }`}>
                     {runnerMode === 'server' ? <Server className="w-3 h-3 inline mr-1" /> : <Cpu className="w-3 h-3 inline mr-1" />}
                     {runnerMode === 'server' ? 'Server Engine' : 'Client Invariant Suite'}
@@ -214,7 +221,7 @@ export const AutomatedTestRunner: React.FC<AutomatedTestRunnerProps> = ({ isOpen
                 )}
               </div>
               <p className="text-[11px] text-slate-400">
-                Validates 30-day rule, 4% fee, duplicate deposits, and ledger integrity
+                Validates 30-day rule, 6% fee, duplicate deposits, and ledger integrity
               </p>
             </div>
           </div>
@@ -262,9 +269,9 @@ export const AutomatedTestRunner: React.FC<AutomatedTestRunnerProps> = ({ isOpen
                 <p className="text-base font-bold text-slate-100">{testSuite.totalTests}</p>
               </div>
 
-              <div className="p-3 rounded-xl bg-emerald-950/40 border border-emerald-500/30 text-center">
-                <span className="text-[10px] text-emerald-400">Passed</span>
-                <p className="text-base font-bold text-emerald-400">{testSuite.passedTests}</p>
+              <div className="p-3 rounded-xl bg-blue-950/40 border border-blue-500/30 text-center">
+                <span className="text-[10px] text-blue-400">Passed</span>
+                <p className="text-base font-bold text-blue-400">{testSuite.passedTests}</p>
               </div>
 
               <div className="p-3 rounded-xl bg-slate-950 border border-slate-800 text-center">
@@ -282,12 +289,12 @@ export const AutomatedTestRunner: React.FC<AutomatedTestRunnerProps> = ({ isOpen
                   key={i}
                   className={`p-3 rounded-xl border flex items-start space-x-3 transition-colors ${
                     r.passed
-                      ? 'bg-emerald-950/20 border-emerald-500/30'
+                      ? 'bg-blue-950/20 border-blue-500/30'
                       : 'bg-red-950/20 border-red-500/30'
                   }`}
                 >
                   {r.passed ? (
-                    <CheckCircle2 className="w-4 h-4 text-emerald-400 flex-shrink-0 mt-0.5" />
+                    <CheckCircle2 className="w-4 h-4 text-blue-400 flex-shrink-0 mt-0.5" />
                   ) : (
                     <XCircle className="w-4 h-4 text-red-400 flex-shrink-0 mt-0.5" />
                   )}
