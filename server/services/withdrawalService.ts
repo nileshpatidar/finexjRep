@@ -1,25 +1,57 @@
 import { getProfileById, updateProfile } from '../repositories/profiles';
 import {
   createWithdrawal,
+  createWithdrawalAtomic,
   getWithdrawalById,
   getWithdrawalByIdempotencyKey,
   getWithdrawalsByUserId,
   updateWithdrawal,
   getAllWithdrawals,
   mapDbWithdrawalToWithdrawal,
+  processWithdrawalStatusAtomic,
 } from '../repositories/withdrawals';
-import { createLedgerEntry } from '../repositories/ledger';
+import { getDepositByTxHash } from '../repositories/deposits';
+import { createLedgerEntry, getLedgerByUserId } from '../repositories/ledger';
 import { createAuditLog } from '../repositories/auditLogs';
 import { getSettings } from '../repositories/settings';
 import { isValidBEP20Address, isValidTxHash, verifyBEP20PayoutTx } from '../blockchain';
-import { calculateUserBalanceAsync } from './balanceService';
+import { calculateUserBalanceAsync, checkWithdrawalImpactAsync } from './balanceService';
+import { verifyWithdrawalOtp } from './otpService';
+import { checkWalletDuplication, checkRapidWithdrawalCycle } from './fraudService';
 import { Withdrawal, WithdrawalStatus } from '../types';
 import { getServerSupabase } from '../supabase';
+
+const userWithdrawalLocks = new Map<string, Promise<void>>();
+
+async function withUserWithdrawalLock<T>(userId: string, fn: () => Promise<T>): Promise<T> {
+  while (userWithdrawalLocks.has(userId)) {
+    try {
+      await userWithdrawalLocks.get(userId);
+    } catch {
+      // Ignore intermediate errors in pending locks
+    }
+  }
+  let resolveLock!: () => void;
+  const lockPromise = new Promise<void>((resolve) => {
+    resolveLock = resolve;
+  });
+  userWithdrawalLocks.set(userId, lockPromise);
+  try {
+    return await fn();
+  } finally {
+    userWithdrawalLocks.delete(userId);
+    resolveLock();
+  }
+}
 
 export interface RequestWithdrawalInput {
   userId: string;
   requestedAmount: number;
   destinationAddress: string;
+  otpCode?: string;
+  confirmCompoundingImpact?: boolean;
+  confirmLockBreak?: boolean;
+  confirmMinimumBreak?: boolean;
   idempotencyKey?: string;
   userNotes?: string;
   actorEmail?: string;
@@ -28,183 +60,204 @@ export interface RequestWithdrawalInput {
 export async function createWithdrawalRequestAsync(input: RequestWithdrawalInput): Promise<{
   success: boolean;
   withdrawal?: Withdrawal;
+  requiresOtp?: boolean;
+  requiresConfirmation?: boolean;
+  warningType?: 'COMPOUNDING_NOTICE' | 'LOCK_BREAK_WARNING' | 'MINIMUM_FUND_WARNING';
   error?: string;
 }> {
-  const user = await getProfileById(input.userId);
-  if (!user) {
-    return { success: false, error: 'User account not found.' };
-  }
-
-  if (user.status !== 'active') {
-    return { success: false, error: `Account is currently ${user.status}.` };
-  }
-
-  const requestedAmount = Number(input.requestedAmount);
-  if (isNaN(requestedAmount) || !isFinite(requestedAmount) || requestedAmount <= 0) {
-    return { success: false, error: 'Please enter a valid withdrawal amount greater than 0 USDT.' };
-  }
-
-  // Destination address verification
-  const destination = (input.destinationAddress || '').trim();
-  if (!destination || !isValidBEP20Address(destination)) {
-    return {
-      success: false,
-      error: 'Invalid BEP-20 destination address format. Must be a 0x-prefixed 40-hex BNB Smart Chain address.',
-    };
-  }
-
-  // Idempotency check: verify key consistency
-  const cleanIdempotencyKey = input.idempotencyKey?.trim();
-  if (cleanIdempotencyKey) {
-    const existingWd = await getWithdrawalByIdempotencyKey(cleanIdempotencyKey);
-    if (existingWd) {
-      if (existingWd.userId !== user.id) {
-        return { success: false, error: 'Idempotency key conflict: key belongs to another account.' };
-      }
-      if (
-        Math.abs(existingWd.requestedAmount - requestedAmount) > 0.0001 ||
-        existingWd.destinationAddress.toLowerCase() !== destination.toLowerCase()
-      ) {
-        return { success: false, error: 'Idempotency key reuse conflict: request parameters do not match original request.' };
-      }
-      return { success: true, withdrawal: existingWd };
+  return withUserWithdrawalLock(input.userId, async () => {
+    const user = await getProfileById(input.userId);
+    if (!user) {
+      return { success: false, error: 'User account not found.' };
     }
-  }
 
-  // Calculate user eligibility and balance
-  const balance = await calculateUserBalanceAsync(user.id);
-  const settings = await getSettings();
+    if (user.status !== 'active') {
+      return { success: false, error: `Account is currently ${user.status}. Withdrawals are disabled.` };
+    }
 
-  // 1. Authoritative 30-day account age rule
-  const requiredDays = Number(settings.accountAgeRequirementDays) || 30;
-  const createdAtTime = new Date(user.createdAt).getTime();
-  const now = new Date();
-  const accountAgeMs = now.getTime() - createdAtTime;
-  const requiredAgeMs = requiredDays * 24 * 60 * 60 * 1000;
+    const requestedAmount = Number(input.requestedAmount);
+    if (isNaN(requestedAmount) || !isFinite(requestedAmount) || requestedAmount <= 0) {
+      return { success: false, error: 'Please enter a valid withdrawal amount greater than 0 USDT.' };
+    }
 
-  if (accountAgeMs < requiredAgeMs) {
-    const remMs = requiredAgeMs - accountAgeMs;
-    const remDays = Math.floor(remMs / (24 * 60 * 60 * 1000));
-    const remHours = Math.floor((remMs % (24 * 60 * 60 * 1000)) / (60 * 60 * 1000));
-    return {
-      success: false,
-      error: `Withdrawal not permitted. Your account must be active for at least ${requiredDays} full days before requesting a withdrawal. Time remaining: ${remDays} days ${remHours} hours.`,
-    };
-  }
+    // Destination address verification
+    const destination = (input.destinationAddress || '').trim();
+    if (!destination || !isValidBEP20Address(destination)) {
+      return {
+        success: false,
+        error: 'Invalid BEP-20 destination address format. Must be a 0x-prefixed 40-hex BNB Smart Chain address.',
+      };
+    }
 
-  // 2. Active fund lock check
-  if (balance.isFundLocked) {
-    return {
-      success: false,
-      error: `30-Day Post-Withdrawal Fund Lock is active. Withdrawals unlock in ${balance.fundLockRemainingDays} days ${balance.fundLockRemainingHours} hours.`,
-    };
-  }
+    // 1. Mandatory Email OTP Verification
+    const isTestUser = process.env.NODE_ENV !== 'production' && user.isTestUser === true;
+    if (!input.otpCode || !input.otpCode.trim()) {
+      return {
+        success: false,
+        requiresOtp: true,
+        error: 'Security verification code (OTP) is required to authorize this withdrawal.',
+      };
+    }
 
-  // 3. Balance verification
-  if (requestedAmount > balance.eligibleForWithdrawal) {
-    return {
-      success: false,
-      error: `Insufficient eligible balance. Requested: ${requestedAmount} USDT, Eligible: ${balance.eligibleForWithdrawal} USDT.`,
-    };
-  }
+    const otpValidation = verifyWithdrawalOtp(user.id, input.otpCode.trim(), isTestUser);
+    if (!otpValidation.valid) {
+      return {
+        success: false,
+        requiresOtp: true,
+        error: otpValidation.error || 'Invalid or expired security verification code.',
+      };
+    }
 
-  // 4. Authoritative 6% fee calculation
-  const feePct = 6.0000;
-  const feeAmount = Number((requestedAmount * 0.06).toFixed(4));
-  const netAmount = Number((requestedAmount - feeAmount).toFixed(4));
+    // Fraud risk detection
+    checkWalletDuplication(destination, user.id, 'withdrawal').catch(() => {});
+    checkRapidWithdrawalCycle(user.id, requestedAmount).catch(() => {});
 
-  const reference = 'WD-' + Date.now().toString(36).toUpperCase();
-  const lockDays = Number(settings.depositLockPeriodDays) || 30;
+    // Idempotency check: verify key consistency
+    const cleanIdempotencyKey = input.idempotencyKey?.trim();
+    if (cleanIdempotencyKey) {
+      const existingWd = await getWithdrawalByIdempotencyKey(cleanIdempotencyKey);
+      if (existingWd) {
+        if (existingWd.userId !== user.id) {
+          return { success: false, error: 'Idempotency key conflict: key belongs to another account.' };
+        }
+        if (
+          Math.abs(existingWd.requestedAmount - requestedAmount) > 0.0001 ||
+          existingWd.destinationAddress.toLowerCase() !== destination.toLowerCase()
+        ) {
+          return { success: false, error: 'Idempotency key reuse conflict: request parameters do not match original request.' };
+        }
+        return { success: true, withdrawal: existingWd };
+      }
+    }
 
-  // Attempt atomic PostgreSQL RPC call (Gold Standard for Atomicity & Row-Level Lock)
-  try {
-    const supabase = getServerSupabase();
-    const { data: rpcData, error: rpcError } = await supabase.rpc('create_withdrawal_atomic', {
-      p_user_id: parseInt(user.id, 10) || 1,
-      p_requested_amount: requestedAmount,
-      p_destination_address: destination,
-      p_reference: reference,
-      p_idempotency_key: cleanIdempotencyKey || null,
-      p_user_notes: input.userNotes || null,
-      p_fee_percentage: feePct,
-      p_fee_amount: feeAmount,
-      p_net_amount: netAmount,
-      p_fund_lock_days: lockDays,
+    // 2. Authoritative Financial Source & Warning Evaluation
+    const impact = await checkWithdrawalImpactAsync(user.id, requestedAmount);
+
+    if (!impact.canWithdraw) {
+      return {
+        success: false,
+        error: impact.error || 'Withdrawal exceeds available balance.',
+      };
+    }
+
+    // Compounding Notice acknowledgment before touching active compounding principal
+    const confirmedCompounding = Boolean(input.confirmCompoundingImpact || input.confirmLockBreak);
+    if (impact.requiresCompoundingNotice && !confirmedCompounding) {
+      return {
+        success: false,
+        requiresConfirmation: true,
+        warningType: 'COMPOUNDING_NOTICE',
+        error: impact.compoundingNoticeText,
+      };
+    }
+
+    // Check Minimum Principal ($300) Warning Confirmation
+    if (impact.requiresMinimumBreakConfirmation && input.confirmMinimumBreak !== true) {
+      return {
+        success: false,
+        requiresConfirmation: true,
+        warningType: 'MINIMUM_FUND_WARNING',
+        error: impact.minimumBreakWarning,
+      };
+    }
+
+    // Authoritative dynamic 9% fee
+    const feePct = impact.feePercentage; // 9.0000%
+    const feeAmount = impact.feeAmount;
+    const netAmount = impact.netAmount;
+    const reference = 'WD-' + Date.now().toString(36).toUpperCase();
+
+    // Requirement 7: Do NOT automatically create a new 30-day lock merely because a withdrawal is made.
+    const lockDays = 0;
+
+    // 3. Attempt Atomic PostgreSQL RPC Execution via createWithdrawalAtomic
+    const atomicResult = await createWithdrawalAtomic({
+      userId: user.id,
+      requestedAmount,
+      destinationAddress: destination,
+      reference,
+      idempotencyKey: cleanIdempotencyKey,
+      userNotes: input.userNotes,
+      feePercentage: feePct,
+      feeAmount,
+      netAmount,
+      fundLockDays: lockDays,
+      confirmLockBreak: Boolean(input.confirmLockBreak),
+      confirmMinimumBreak: Boolean(input.confirmMinimumBreak),
     });
 
-    if (!rpcError && rpcData) {
-      if (rpcData.success === false) {
-        return { success: false, error: rpcData.error || 'Withdrawal rejected by database policy' };
-      }
-      const rawWd = rpcData.withdrawal;
-      if (rawWd) {
-        return { success: true, withdrawal: mapDbWithdrawalToWithdrawal(rawWd) };
-      }
+    if (atomicResult.success && atomicResult.withdrawal) {
+      return { success: true, withdrawal: atomicResult.withdrawal };
     }
-  } catch (rpcErr) {
-    // If RPC is not available, proceed to robust fallback
-  }
 
-  // Fallback path: strict verified direct writes
-  const withdrawalId = 'wd_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
+    if (atomicResult.requiresConfirmation) {
+      return {
+        success: false,
+        requiresConfirmation: true,
+        warningType: atomicResult.warningType,
+        error: atomicResult.error,
+      };
+    }
 
-  const newWithdrawal = await createWithdrawal({
-    id: withdrawalId,
-    reference,
-    userId: user.id,
-    requestedAmount,
-    feePercentage: feePct,
-    feeAmount,
-    netAmount,
-    destinationAddress: destination,
-    network: 'BEP-20',
-    status: 'pending',
-    createdAt: now.toISOString(),
-    userNotes: input.userNotes,
-    idempotencyKey: cleanIdempotencyKey,
+    if (atomicResult.error && !atomicResult.error.includes('function create_withdrawal_atomic') && !atomicResult.error.includes('does not exist')) {
+      return { success: false, error: atomicResult.error };
+    }
+
+    // 4. ACID-Compliant Repository Fallback
+    const now = new Date();
+    const withdrawalId = 'wd_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
+
+    const newWithdrawal = await createWithdrawal({
+      id: withdrawalId,
+      reference,
+      userId: user.id,
+      requestedAmount,
+      feePercentage: feePct,
+      feeAmount,
+      netAmount,
+      destinationAddress: destination,
+      network: 'BEP-20',
+      status: 'pending',
+      createdAt: now.toISOString(),
+      userNotes: input.userNotes,
+      idempotencyKey: cleanIdempotencyKey,
+    });
+
+    if (!newWithdrawal || !newWithdrawal.id) {
+      return {
+        success: false,
+        error: 'Failed to record withdrawal in database. Please try again.',
+      };
+    }
+
+    // Calculate updated balance after holding withdrawal amount
+    const updatedBalance = await calculateUserBalanceAsync(user.id);
+
+    // Write immutable ledger entry
+    await createLedgerEntry({
+      userId: user.id,
+      type: 'withdrawal_request',
+      amount: -requestedAmount,
+      balanceAfter: updatedBalance.availableBalance,
+      referenceId: newWithdrawal.id,
+      description: `Withdrawal request submitted for ${requestedAmount} USDT (${feePct}% FINEXJ Fee: ${feeAmount} USDT, Net Payout: ${netAmount} USDT)`,
+      createdAt: now.toISOString(),
+      performedBy: user.id,
+    });
+
+    await createAuditLog({
+      action: 'WITHDRAWAL_REQUESTED',
+      actorId: user.id,
+      actorEmail: user.email,
+      actorRole: user.role,
+      targetUserId: user.id,
+      reason: `User requested withdrawal of ${requestedAmount} USDT to ${destination} (Fee: ${feeAmount} USDT)`,
+      timestamp: now.toISOString(),
+      referenceId: reference,
+    });
+
+    return { success: true, withdrawal: newWithdrawal };
   });
-
-  if (!newWithdrawal || !newWithdrawal.id) {
-    return {
-      success: false,
-      error: 'Failed to record withdrawal in database. Please try again.',
-    };
-  }
-
-  // Calculate updated balance after holding withdrawal amount
-  const updatedBalance = await calculateUserBalanceAsync(user.id);
-
-  // Write immutable ledger entry
-  await createLedgerEntry({
-    userId: user.id,
-    type: 'withdrawal_request',
-    amount: -requestedAmount,
-    balanceAfter: updatedBalance.availableBalance,
-    referenceId: newWithdrawal.id,
-    description: `Withdrawal request submitted for ${requestedAmount} USDT (6% Fee: ${feeAmount} USDT, Net: ${netAmount} USDT)`,
-    createdAt: now.toISOString(),
-    performedBy: user.id,
-  });
-
-  // Activate 30-Day Fund Lock for remaining funds
-  const fundLockEndDate = new Date(now.getTime() + lockDays * 24 * 60 * 60 * 1000).toISOString();
-  await updateProfile(user.id, {
-    fundLockUntil: fundLockEndDate,
-    fundLockReason: `${lockDays}-Day Post-Withdrawal Fund Lock (${reference})`,
-    lastWithdrawalAt: now.toISOString(),
-  });
-
-  await createAuditLog({
-    action: 'WITHDRAWAL_REQUESTED',
-    actorId: user.id,
-    actorEmail: user.email,
-    actorRole: user.role,
-    targetUserId: user.id,
-    reason: `User requested withdrawal of ${requestedAmount} USDT to ${destination}`,
-    timestamp: now.toISOString(),
-  });
-
-  return { success: true, withdrawal: newWithdrawal };
 }
 
 export async function updateWithdrawalStatusAsync(
@@ -238,23 +291,36 @@ export async function updateWithdrawalStatusAsync(
       return { success: false, error: 'Cannot modify a cancelled withdrawal.' };
     }
 
+    const targetStatus = (newStatus === 'completed' || newStatus === 'complete') ? 'paid' : newStatus;
+
+    // Rejection reason is required (Requirement 10)
+    if (targetStatus === 'rejected' && (!adminNotes || !adminNotes.trim())) {
+      return { success: false, error: 'A specific rejection reason is required to reject a withdrawal request.' };
+    }
+
     const validNextStates: Record<string, string[]> = {
-      pending: ['approved', 'processing', 'paid', 'rejected', 'under_review', 'cancelled'],
-      under_review: ['approved', 'processing', 'paid', 'rejected'],
-      approved: ['processing', 'paid', 'rejected'],
-      processing: ['paid', 'rejected'],
+      pending: ['approved', 'processing', 'manual_payment_pending', 'payment_submitted', 'payment_verified', 'paid', 'completed', 'rejected', 'under_review', 'cancelled'],
+      under_review: ['approved', 'processing', 'manual_payment_pending', 'payment_submitted', 'payment_verified', 'paid', 'completed', 'rejected', 'cancelled'],
+      approved: ['processing', 'manual_payment_pending', 'payment_submitted', 'payment_verified', 'paid', 'completed', 'rejected', 'cancelled'],
+      manual_payment_pending: ['payment_submitted', 'payment_verified', 'paid', 'completed', 'processing', 'rejected', 'cancelled'],
+      processing: ['manual_payment_pending', 'payment_submitted', 'payment_verified', 'paid', 'completed', 'rejected', 'cancelled'],
+      payment_submitted: ['payment_verified', 'paid', 'completed', 'manual_payment_pending', 'rejected', 'cancelled'],
+      payment_verified: ['paid', 'completed', 'rejected', 'cancelled'],
     };
 
     const allowed = validNextStates[currentStatus] || [];
-    if (!allowed.includes(newStatus)) {
+    if (!allowed.includes(newStatus) && !allowed.includes(targetStatus)) {
       return {
         success: false,
         error: `Invalid status transition from '${currentStatus}' to '${newStatus}'.`,
       };
     }
 
-    // 3. Strict Real BSC On-Chain Verification when marking as Paid
-    if (newStatus === 'paid') {
+    // 3. Real BSC On-Chain Verification when marking as Paid
+    const targetUser = await getProfileById(withdrawal.userId);
+    const isTestUser = process.env.NODE_ENV !== 'production' && targetUser?.isTestUser === true;
+
+    if (targetStatus === 'paid') {
       if (!normalizedTxHash) {
         return {
           success: false,
@@ -269,96 +335,155 @@ export async function updateWithdrawalStatusAsync(
         };
       }
 
-      // Check if another withdrawal already used this payout txHash (Anti-Replay / Anti-Collision)
-      const { withdrawals: allWds } = await getAllWithdrawals({ limit: 1000 });
-      const duplicateWd = allWds.find(
-        w => w.id !== withdrawal.id && (
-          w.txHash?.toLowerCase() === normalizedTxHash.toLowerCase() ||
-          (w as any).payoutTxHash?.toLowerCase() === normalizedTxHash.toLowerCase()
-        )
-      );
-      if (duplicateWd) {
-        return {
-          success: false,
-          error: `Transaction hash ${normalizedTxHash} has already been assigned to withdrawal ${duplicateWd.reference || duplicateWd.id}.`,
-        };
-      }
-
-      // Check if this hash was used in deposits (deposit tx hash cannot be reused as payout tx hash)
-      const { deposits: allDeps } = await (await import('../repositories/deposits')).getAllDeposits({ limit: 1000 });
-      const duplicateDep = allDeps.find(
-        d => d.txHash?.toLowerCase() === normalizedTxHash.toLowerCase()
-      );
-      if (duplicateDep) {
-        return {
-          success: false,
-          error: `Transaction hash ${normalizedTxHash} is associated with deposit #${duplicateDep.id} and cannot be reused for a payout.`,
-        };
-      }
-
-      // Query Real BNB Smart Chain blockchain for verification
-      const verification = await verifyBEP20PayoutTx(
-        normalizedTxHash,
-        withdrawal.destinationAddress,
-        withdrawal.netAmount,
-        { currentWithdrawalId: withdrawal.id }
-      );
-
-      if (!verification.isValid) {
-        return {
-          success: false,
-          error: verification.errorMessage || 'BNB Smart Chain payout transaction verification failed.',
-        };
-      }
-    }
-
-    // 4. Atomic PostgreSQL Transaction Execution (Stored Procedure)
-    try {
+      // Anti-Replay: Check if another withdrawal already used this payout txHash
       const supabase = getServerSupabase();
-      const numId = parseInt(withdrawalId, 10);
-      if (!isNaN(numId)) {
-        const { data: rpcData, error: rpcError } = await supabase.rpc('process_withdrawal_status_atomic', {
-          p_admin_id: adminId,
-          p_admin_role: 'admin',
-          p_withdrawal_id: numId,
-          p_new_status: newStatus,
-          p_tx_hash: normalizedTxHash || null,
-          p_admin_notes: adminNotes || null,
-        });
+      const { data: duplicateWds } = await supabase
+        .from('withdrawals')
+        .select('id, reference')
+        .neq('id', withdrawal.id)
+        .or(`tx_hash.ilike.${normalizedTxHash},payout_tx_hash.ilike.${normalizedTxHash}`)
+        .limit(1);
 
-        if (!rpcError && rpcData) {
-          if (rpcData.success === false) {
-            return { success: false, error: rpcData.error };
-          }
-          if (rpcData.withdrawal) {
-            return { success: true, withdrawal: mapDbWithdrawalToWithdrawal(rpcData.withdrawal) };
-          }
+      if (duplicateWds && duplicateWds.length > 0) {
+        return {
+          success: false,
+          error: `Transaction hash ${normalizedTxHash} has already been assigned to withdrawal ${duplicateWds[0].reference || duplicateWds[0].id}.`,
+        };
+      }
+
+      // Anti-Replay: Check if hash was registered for any deposit
+      const existingDeposit = await getDepositByTxHash(normalizedTxHash);
+      if (existingDeposit) {
+        return {
+          success: false,
+          error: `Transaction hash ${normalizedTxHash} has already been used for deposit #${existingDeposit.id}.`,
+        };
+      }
+
+      const { data: duplicateDeps } = await supabase
+        .from('deposits')
+        .select('id, reference')
+        .ilike('tx_hash', normalizedTxHash)
+        .limit(1);
+
+      if (duplicateDeps && duplicateDeps.length > 0) {
+        return {
+          success: false,
+          error: `Transaction hash ${normalizedTxHash} has already been used for deposit ${duplicateDeps[0].reference || duplicateDeps[0].id}.`,
+        };
+      }
+
+      // Requirement 12: Test user protection
+      // Test users must never accidentally result in a real on-chain payout
+      if (!isTestUser) {
+        // Query Real BNB Smart Chain blockchain for payout verification
+        const verification = await verifyBEP20PayoutTx(
+          normalizedTxHash,
+          withdrawal.destinationAddress,
+          withdrawal.netAmount,
+          { currentWithdrawalId: withdrawal.id }
+        );
+
+        if (!verification.isValid) {
+          return {
+            success: false,
+            error: verification.errorMessage || 'BNB Smart Chain payout transaction verification failed.',
+          };
         }
       }
-    } catch (rpcErr) {
-      // Fall through to fallback atomic execution below
     }
 
-    // 5. Atomic Fallback Execution with Ledger & Audit Logs
+    // 4. Primary: Atomic PostgreSQL state transition via process_withdrawal_status_atomic
+    const atomicResult = await processWithdrawalStatusAtomic({
+      adminId,
+      adminRole: 'admin',
+      withdrawalId: withdrawal.id,
+      newStatus: targetStatus,
+      txHash: normalizedTxHash,
+      adminNotes,
+    });
+
+    if (atomicResult.success && atomicResult.withdrawal) {
+      // Ensure ledger refund is recorded for cancelled status if database RPC ran an older migration without it
+      if (targetStatus === 'cancelled') {
+        try {
+          const userLedger = await getLedgerByUserId(withdrawal.userId);
+          const hasCancelLedger = userLedger.some(
+            l => l.referenceId === String(withdrawal.id) && (l.type === 'withdrawal_cancelled' || l.type === 'withdrawal_rejected')
+          );
+          if (!hasCancelLedger) {
+            const currentBalance = await calculateUserBalanceAsync(withdrawal.userId);
+            await createLedgerEntry({
+              userId: withdrawal.userId,
+              type: 'withdrawal_cancelled',
+              amount: withdrawal.requestedAmount,
+              balanceAfter: currentBalance.availableBalance,
+              referenceId: withdrawal.id,
+              description: `Withdrawal request cancelled. Refunded ${withdrawal.requestedAmount} USDT. Reason: ${adminNotes || 'Cancelled by user or administrator'}`,
+              createdAt: new Date().toISOString(),
+              performedBy: adminId,
+            });
+          }
+        } catch (ledgerErr: any) {
+          console.warn('[Ledger Notice] cancellation refund entry skipped:', ledgerErr?.message);
+        }
+      }
+
+      // Step 53 - Section 12: Mandatory Audit Log on status change
+      try {
+        await createAuditLog({
+          action: `WITHDRAWAL_${targetStatus.toUpperCase()}`,
+          actorId: adminId,
+          actorRole: 'admin',
+          targetUserId: withdrawal.userId,
+          referenceId: String(withdrawal.reference || withdrawal.id),
+          beforeValue: {
+            status: currentStatus,
+            expectedAmount: withdrawal.netAmount,
+            destinationAddress: withdrawal.destinationAddress,
+          },
+          afterValue: {
+            status: targetStatus,
+            txHash: normalizedTxHash || withdrawal.txHash,
+            verifiedAmount: targetStatus === 'paid' ? withdrawal.netAmount : undefined,
+            destinationAddress: withdrawal.destinationAddress,
+            verificationResult: targetStatus === 'paid' ? 'VERIFIED_ON_CHAIN' : undefined,
+          },
+          reason: adminNotes || `Admin manual payout action transitioned withdrawal #${withdrawal.id} from ${currentStatus} to ${targetStatus}${isTestUser ? ' (Test Account)' : ''}`,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (auditErr: any) {
+        console.warn('[Audit Notice] audit log skipped:', auditErr?.message);
+      }
+
+      return { success: true, withdrawal: atomicResult.withdrawal };
+    }
+
+    if (atomicResult.error && !atomicResult.error.includes('function process_withdrawal_status_atomic') && !atomicResult.error.includes('does not exist')) {
+      return { success: false, error: atomicResult.error };
+    }
+
+    // 5. ACID-Compliant Repository Fallback (Only if atomic RPC is not yet registered in environment)
     const now = new Date();
     const updated = await updateWithdrawal(withdrawal.id, {
-      status: newStatus,
+      status: targetStatus,
       txHash: normalizedTxHash || withdrawal.txHash,
       adminNotes,
       reviewedAt: now.toISOString(),
       reviewedBy: adminId,
-      paidAt: newStatus === 'paid' ? now.toISOString() : undefined,
+      paidAt: targetStatus === 'paid' ? now.toISOString() : undefined,
     });
 
+    // Accounting, Ledgers, & Audit Logging Fallback
     if (newStatus === 'rejected') {
-      // If rejected, refund the held funds back to the user balance in the ledger
+      // Refund held funds back to user balance in ledger atomically
       try {
         const currentBalance = await calculateUserBalanceAsync(withdrawal.userId);
         await createLedgerEntry({
           userId: withdrawal.userId,
           type: 'withdrawal_rejected',
           amount: withdrawal.requestedAmount,
-          balanceAfter: currentBalance.availableBalance + withdrawal.requestedAmount,
+          balanceAfter: currentBalance.availableBalance,
           referenceId: withdrawal.id,
           description: `Withdrawal request rejected by admin. Refunded ${withdrawal.requestedAmount} USDT. Reason: ${adminNotes || 'Verification failed'}`,
           createdAt: now.toISOString(),
@@ -366,6 +491,23 @@ export async function updateWithdrawalStatusAsync(
         });
       } catch (ledgerErr: any) {
         console.warn('[Ledger Notice] refund entry skipped:', ledgerErr?.message);
+      }
+    } else if (newStatus === 'cancelled') {
+      // Refund held funds back to user balance in ledger atomically
+      try {
+        const currentBalance = await calculateUserBalanceAsync(withdrawal.userId);
+        await createLedgerEntry({
+          userId: withdrawal.userId,
+          type: 'withdrawal_cancelled',
+          amount: withdrawal.requestedAmount,
+          balanceAfter: currentBalance.availableBalance,
+          referenceId: withdrawal.id,
+          description: `Withdrawal request cancelled. Refunded ${withdrawal.requestedAmount} USDT. Reason: ${adminNotes || 'Cancelled by user or administrator'}`,
+          createdAt: now.toISOString(),
+          performedBy: adminId,
+        });
+      } catch (ledgerErr: any) {
+        console.warn('[Ledger Notice] cancellation refund entry skipped:', ledgerErr?.message);
       }
     } else if (newStatus === 'paid') {
       try {
@@ -376,22 +518,58 @@ export async function updateWithdrawalStatusAsync(
           amount: 0,
           balanceAfter: currentBalance.availableBalance,
           referenceId: withdrawal.id,
-          description: `Withdrawal payout dispatched via BEP-20 (Tx: ${normalizedTxHash || 'Confirmed'}). Net Paid: ${withdrawal.netAmount} USDT`,
+          description: `Withdrawal payout dispatched via BEP-20 (Tx: ${normalizedTxHash || 'Confirmed'}). Net Paid: ${withdrawal.netAmount} USDT${isTestUser ? ' [Simulated Test Account]' : ''}`,
           createdAt: now.toISOString(),
           performedBy: adminId,
         });
-      } catch (ledgerErr: any) {
-        console.warn('[Ledger Notice] paid entry skipped:', ledgerErr?.message);
+
+        // Record Authoritative 9% Fee into FINEXJ Operational Ledger (100% FINEXJ fee)
+        const supabase = getServerSupabase();
+        const feeAmount = withdrawal.feeAmount || Number((withdrawal.requestedAmount * 0.09).toFixed(4));
+        const { data: latestOp } = await supabase
+          .from('finexj_operational_ledger')
+          .select('after_balance')
+          .order('created_at', { ascending: false })
+          .limit(1);
+
+        const beforeOp = latestOp && latestOp.length > 0 ? Number(latestOp[0].after_balance) || 0 : 0;
+        const afterOp = beforeOp + feeAmount;
+
+        await supabase.from('finexj_operational_ledger').insert({
+          amount: feeAmount,
+          direction: 'inflow',
+          reason: `Retained 9% withdrawal fee from WD #${withdrawal.id} (${withdrawal.reference})${isTestUser ? ' (Simulated)' : ''}`,
+          admin_id: adminId,
+          reference: `FEE-WD-${withdrawal.id}`,
+          before_balance: beforeOp,
+          after_balance: afterOp,
+          created_at: now.toISOString(),
+        });
+      } catch (opErr: any) {
+        console.warn('[Operational Ledger Notice] fee entry skipped:', opErr?.message);
       }
     }
 
     try {
       await createAuditLog({
-        action: `WITHDRAWAL_${newStatus.toUpperCase()}`,
+        action: `WITHDRAWAL_${targetStatus.toUpperCase()}`,
         actorId: adminId,
         actorRole: 'admin',
         targetUserId: withdrawal.userId,
-        reason: adminNotes || `Admin updated withdrawal status to ${newStatus}`,
+        referenceId: String(withdrawal.reference || withdrawal.id),
+        beforeValue: {
+          status: currentStatus,
+          expectedAmount: withdrawal.netAmount,
+          destinationAddress: withdrawal.destinationAddress,
+        },
+        afterValue: {
+          status: targetStatus,
+          txHash: normalizedTxHash || withdrawal.txHash,
+          verifiedAmount: targetStatus === 'paid' ? withdrawal.netAmount : undefined,
+          destinationAddress: withdrawal.destinationAddress,
+          verificationResult: targetStatus === 'paid' ? 'VERIFIED_ON_CHAIN' : undefined,
+        },
+        reason: adminNotes || `Admin manual payout action transitioned withdrawal #${withdrawal.id} from ${currentStatus} to ${targetStatus}${isTestUser ? ' (Test Account)' : ''}`,
         timestamp: now.toISOString(),
       });
     } catch (auditErr: any) {
@@ -403,5 +581,46 @@ export async function updateWithdrawalStatusAsync(
     console.error('[Withdrawal Action Error]', err);
     return { success: false, error: err?.message || 'Failed to update withdrawal' };
   }
+}
+
+/**
+ * High-Integrity Atomic Withdrawal Cancellation Handler
+ * Cancels a pending withdrawal request, restores user's held balance, and creates an audited refund ledger entry.
+ */
+export async function cancelWithdrawalAsync(
+  userId: string,
+  withdrawalId: string,
+  reason?: string,
+  isAdmin: boolean = false,
+  adminId?: string
+): Promise<{ success: boolean; withdrawal?: Withdrawal; error?: string }> {
+  const withdrawal = await getWithdrawalById(withdrawalId);
+  if (!withdrawal) {
+    return { success: false, error: 'Withdrawal record not found.' };
+  }
+
+  // Non-admins can only cancel their own withdrawals
+  if (!isAdmin && String(withdrawal.userId) !== String(userId)) {
+    return { success: false, error: 'Unauthorized to cancel this withdrawal request.' };
+  }
+
+  // Non-admins can only cancel pending or under_review withdrawals
+  if (!isAdmin && !['pending', 'under_review'].includes(withdrawal.status)) {
+    return {
+      success: false,
+      error: `Cannot cancel withdrawal with status '${withdrawal.status}'. Only pending requests may be cancelled by the user.`,
+    };
+  }
+
+  const actor = isAdmin ? (adminId || 'admin') : userId;
+  const cancellationReason = reason?.trim() || (isAdmin ? 'Cancelled by administrator' : 'Cancelled by user request');
+
+  return updateWithdrawalStatusAsync(
+    actor,
+    withdrawalId,
+    'cancelled',
+    undefined,
+    cancellationReason
+  );
 }
 

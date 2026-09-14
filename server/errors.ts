@@ -12,6 +12,8 @@ export type StandardErrorCode =
   | 'DEPOSIT_NOT_FOUND'
   | 'DEPOSIT_ALREADY_PROCESSED'
   | 'INVALID_DEPOSIT'
+  | 'WITHDRAWAL_NOT_FOUND'
+  | 'WITHDRAWAL_ALREADY_PROCESSED'
   | 'INVALID_TRANSACTION_HASH'
   | 'TRANSACTION_NOT_VERIFIED'
   | 'WITHDRAWAL_NOT_ELIGIBLE'
@@ -112,6 +114,15 @@ export function centralErrorHandler(
     statusCode = err.statusCode;
     errorCode = err.code;
     message = err.safeUserMessage;
+  } else if (err instanceof SyntaxError && (err as any).status === 400 && 'body' in (err as any)) {
+    // Malformed JSON payload sent by client
+    statusCode = 400;
+    errorCode = 'VALIDATION_ERROR';
+    message = 'Malformed JSON payload. Please check your request body syntax.';
+  } else if ((err as any)?.type === 'entity.too.large') {
+    statusCode = 413;
+    errorCode = 'VALIDATION_ERROR';
+    message = 'Request payload exceeds maximum permitted size.';
   } else if (err && typeof err === 'object' && err.message) {
     // Check if it's a known string error thrown by business rules
     const rawMsg = err.message;
@@ -123,6 +134,10 @@ export function centralErrorHandler(
       errorCode = 'INVALID_TRANSACTION_HASH';
       statusCode = 400;
       message = 'Invalid BEP-20 transaction hash format.';
+    } else if (rawMsg.includes('Invalid settings update')) {
+      errorCode = 'VALIDATION_ERROR';
+      statusCode = 400;
+      message = rawMsg;
     } else if (rawMsg.includes('Minimum deposit')) {
       errorCode = 'INVALID_DEPOSIT';
       statusCode = 400;

@@ -30,7 +30,12 @@ import {
   Activity,
   Lock,
   ChevronDown,
+  Landmark,
 } from 'lucide-react';
+import { AdminAccountingView } from './AdminAccountingView';
+import { AdminUsersView } from './AdminUsersView';
+import { AdminDepositsView } from './AdminDepositsView';
+import { AdminWithdrawalsView } from './AdminWithdrawalsView';
 
 interface AdminDashboardProps {
   onBackToUser?: () => void;
@@ -38,7 +43,7 @@ interface AdminDashboardProps {
 
 export const AdminDashboard: React.FC<AdminDashboardProps> = () => {
   const { user } = useAuth();
-  const [activeTab, setActiveTab] = useState<'overview' | 'users' | 'deposits' | 'withdrawals' | 'performance' | 'adjustments' | 'security' | 'logs' | 'audit' | 'settings'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'accounting' | 'users' | 'deposits' | 'withdrawals' | 'performance' | 'adjustments' | 'security' | 'logs' | 'audit' | 'settings'>('overview');
   const [dashboardData, setDashboardData] = useState<any>(null);
   const [users, setUsers] = useState<any[]>([]);
   const [deposits, setDeposits] = useState<any[]>([]);
@@ -80,7 +85,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = () => {
   const [adjustAmount, setAdjustAmount] = useState('');
   const [adjustReason, setAdjustReason] = useState('');
 
+  const isAdmin = user?.role === 'admin' || user?.role === 'super_admin';
+
   const loadAllAdminData = async () => {
+    if (!isAdmin) return;
     setIsLoading(true);
     try {
       const [dash, uList, dList, wList, pList, aList, sList] = await Promise.all([
@@ -107,8 +115,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = () => {
   };
 
   useEffect(() => {
-    loadAllAdminData();
-  }, []);
+    if (isAdmin) {
+      loadAllAdminData();
+    }
+  }, [isAdmin]);
 
   const handleApplyPerformance = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -266,6 +276,22 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = () => {
     return d.status === depositFilter;
   });
 
+  if (!isAdmin) {
+    return (
+      <div className="max-w-md mx-auto my-12 p-8 rounded-3xl bg-white dark:bg-[#0F172A] border border-red-200 dark:border-red-900/50 shadow-xl text-center space-y-4">
+        <div className="w-12 h-12 rounded-2xl bg-red-100 dark:bg-red-900/30 text-red-600 dark:text-red-400 flex items-center justify-center mx-auto">
+          <ShieldAlert className="w-6 h-6" />
+        </div>
+        <h2 className="text-base font-bold text-slate-900 dark:text-white">
+          Access Denied
+        </h2>
+        <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
+          You do not have administrative privileges to access this area. All administrative access attempts are monitored and logged.
+        </p>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-6 max-w-6xl mx-auto pb-24 text-xs">
       {/* Admin Top Banner */}
@@ -326,6 +352,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = () => {
       <div className="flex flex-wrap items-center gap-1.5 p-1.5 rounded-2xl bg-slate-100 dark:bg-slate-900/60 border border-slate-200 dark:border-slate-800">
         {[
           { id: 'overview', label: 'Overview', icon: TrendingUp },
+          ...(user?.role === 'super_admin' ? [{ id: 'accounting', label: 'FINEXJ Accounting', icon: Landmark }] : []),
           { id: 'deposits', label: 'Deposits', icon: ArrowDownToLine },
           { id: 'withdrawals', label: 'Withdrawals', icon: ArrowUpFromLine },
           { id: 'users', label: 'Users', icon: Users },
@@ -499,7 +526,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = () => {
 
             {/* 6. Withdrawal Fees */}
             <div className="p-4 rounded-2xl bg-white dark:bg-[#0F172A] border border-slate-200 dark:border-slate-800 space-y-1 shadow-sm">
-              <span className="text-[11px] text-slate-500 dark:text-slate-400 font-medium">Withdrawal Fees ({appSettings?.withdrawalFeePercentage ?? 6}%)</span>
+              <span className="text-[11px] text-slate-500 dark:text-slate-400 font-medium">Withdrawal Fees ({appSettings?.withdrawalFeePercentage !== undefined ? `${appSettings.withdrawalFeePercentage}%` : '—'})</span>
               <p className="text-xl font-bold text-indigo-600 dark:text-indigo-400">
                 ${(stats?.totalWithdrawalFees || 0).toFixed(2)} USDT
               </p>
@@ -618,7 +645,10 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = () => {
             {/* Live Overall Fund & Distribution Banner */}
             {(() => {
               const liveConfirmedDeposits = deposits.filter(d => d.status === 'confirmed');
-              const liveFundPrincipal = liveConfirmedDeposits.reduce((acc, d) => acc + (d.amount || 0), 0);
+              const totalConfirmedDeposits = liveConfirmedDeposits.reduce((acc, d) => acc + (d.amount || 0), 0);
+              const paidWithdrawals = withdrawals.filter(w => w.status === 'paid');
+              const totalPaidWithdrawals = paidWithdrawals.reduce((acc, w) => acc + (w.requestedAmount || 0), 0);
+              const liveFundPrincipal = Math.max(0, totalConfirmedDeposits - totalPaidWithdrawals);
               const currentPercentNum = parseFloat(perfPercent || '0') || 0;
               const multiplier = perfMode === 'safe' ? 0 : perfMode === 'loss' ? -currentPercentNum / 100 : currentPercentNum / 100;
               const estDistribution = liveFundPrincipal * multiplier;
@@ -921,429 +951,22 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = () => {
         </div>
       )}
 
-      {/* TAB: DEPOSITS */}
+      {/* TAB: FINEXJ ACCOUNTING */}
+      {activeTab === 'accounting' && <AdminAccountingView />}
+
+      {/* TAB: DEPOSITS (STEP 13) */}
       {activeTab === 'deposits' && (
-        <div className="space-y-4">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div>
-              <h2 className="text-sm font-bold text-slate-900 dark:text-white uppercase tracking-wider flex items-center space-x-2">
-                <ArrowDownToLine className="w-4 h-4 text-blue-600 dark:text-blue-400" />
-                <span>User Deposits & Payment Proof Review ({filteredDeposits.length})</span>
-              </h2>
-              <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
-                Inspect uploaded payment receipts, verify BSC transactions on BscScan, and approve deposits to credit user balances.
-              </p>
-            </div>
-
-            {/* Filter Buttons */}
-            <div className="flex items-center space-x-1.5 p-1 rounded-xl bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs">
-              {[
-                { id: 'all', label: `All (${deposits.length})` },
-                { id: 'pending', label: `Pending Review (${deposits.filter(d => d.status === 'pending').length})` },
-                { id: 'confirmed', label: `Confirmed (${deposits.filter(d => d.status === 'confirmed').length})` },
-                { id: 'rejected', label: `Rejected (${deposits.filter(d => d.status === 'rejected').length})` },
-              ].map(f => (
-                <button
-                  key={f.id}
-                  onClick={() => setDepositFilter(f.id as any)}
-                  className={`px-2.5 py-1 rounded-lg font-semibold transition cursor-pointer ${
-                    depositFilter === f.id
-                      ? 'bg-blue-600 text-white shadow-sm'
-                      : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
-                  }`}
-                >
-                  {f.label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {filteredDeposits.length === 0 ? (
-            <div className="p-8 text-center rounded-2xl bg-white dark:bg-[#0F172A] border border-slate-200 dark:border-slate-800 text-slate-500 dark:text-slate-400">
-              No deposits match the selected filter.
-            </div>
-          ) : (
-            <div className="space-y-3">
-              {filteredDeposits.map((dep) => {
-                const targetUser = users.find(u => u.id === dep.userId);
-                return (
-                  <div
-                    key={dep.id}
-                    className="p-5 rounded-2xl bg-white dark:bg-[#0F172A] border border-slate-200 dark:border-slate-800 flex flex-col lg:flex-row lg:items-center justify-between gap-4 shadow-sm hover:border-blue-500/30 transition"
-                  >
-                    <div className="space-y-2 flex-1">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="text-base font-bold text-slate-900 dark:text-white">
-                          ${Number(dep.amount || 0).toFixed(2)} USDT
-                        </span>
-                        <span
-                          className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold ${
-                            dep.status === 'confirmed'
-                              ? 'bg-blue-50 dark:bg-blue-950/50 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800/60'
-                              : dep.status === 'rejected'
-                              ? 'bg-rose-50 dark:bg-rose-950/50 text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-800/60'
-                              : 'bg-amber-50 dark:bg-amber-950/50 text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-amber-800/60'
-                          }`}
-                        >
-                          {dep.status === 'confirmed' ? '✓ CONFIRMED & CREDITED' : dep.status === 'rejected' ? '✕ REJECTED' : '⏳ PENDING PROOF REVIEW'}
-                        </span>
-                        <span className="text-[11px] text-slate-500 dark:text-slate-400 font-mono">
-                          Ref: {dep.reference || dep.id}
-                        </span>
-                      </div>
-
-                      {/* User & Submission Details */}
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs text-slate-600 dark:text-slate-300">
-                        <div>
-                          <p>
-                            <strong>User:</strong> {targetUser ? `${targetUser.fullName} (${targetUser.email})` : dep.userId}
-                          </p>
-                          <p className="text-[11px] text-slate-400">
-                            <strong>Date:</strong> {new Date(dep.createdAt).toLocaleString()}
-                          </p>
-                        </div>
-                        <div>
-                          {dep.txHash ? (
-                            <p className="flex items-center space-x-1.5">
-                              <strong>Tx Hash:</strong>
-                              <a
-                                href={`https://bscscan.com/tx/${dep.txHash}`}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="font-mono text-blue-600 dark:text-blue-400 hover:underline flex items-center space-x-1 inline-flex"
-                              >
-                                <span>{dep.txHash.slice(0, 10)}...{dep.txHash.slice(-6)}</span>
-                                <ExternalLink className="w-3 h-3" />
-                              </a>
-                            </p>
-                          ) : (
-                            <p className="text-slate-400 italic">No blockchain tx hash provided</p>
-                          )}
-                          {dep.userNotes && (
-                            <p className="text-slate-500 dark:text-slate-400 text-[11px]">
-                              <strong>User Note:</strong> &ldquo;{dep.userNotes}&rdquo;
-                            </p>
-                          )}
-                        </div>
-                      </div>
-
-                      {/* Admin Note if already reviewed */}
-                      {dep.adminNotes && (
-                        <div className="p-2 rounded-xl bg-slate-50 dark:bg-slate-900 text-[11px] text-slate-600 dark:text-slate-400 border border-slate-200 dark:border-slate-800">
-                          <strong>Admin Review Note:</strong> {dep.adminNotes} (by {dep.reviewedBy || 'Admin'})
-                        </div>
-                      )}
-                    </div>
-
-                    {/* Proof Photo & Actions */}
-                    <div className="flex flex-row lg:flex-col items-center lg:items-end justify-between gap-3 pt-2 lg:pt-0 border-t lg:border-t-0 border-slate-100 dark:border-slate-800">
-                      {/* Photo Proof Preview Button / Thumbnail */}
-                      {dep.proofPhotoUrl ? (
-                        <button
-                          onClick={() => setPreviewPhotoModal({
-                            url: dep.proofPhotoUrl,
-                            title: `Deposit Proof - $${Number(dep.amount || 0).toFixed(2)} USDT (${dep.reference || dep.id})`
-                          })}
-                          className="flex items-center space-x-2 p-1.5 pr-3 rounded-xl bg-blue-50 dark:bg-blue-950/40 hover:bg-blue-100 dark:hover:bg-blue-900/50 border border-blue-200 dark:border-blue-800/60 text-blue-700 dark:text-blue-300 font-semibold transition cursor-pointer"
-                        >
-                          <img
-                            src={dep.proofPhotoUrl}
-                            alt="Receipt"
-                            className="w-9 h-9 rounded-lg object-cover border border-blue-200 dark:border-blue-700"
-                          />
-                          <div className="text-left text-[11px]">
-                            <span className="block font-bold">View Receipt</span>
-                            <span className="text-[9px] text-blue-600 dark:text-blue-400 flex items-center space-x-0.5">
-                              <Eye className="w-2.5 h-2.5" />
-                              <span>Click to Inspect</span>
-                            </span>
-                          </div>
-                        </button>
-                      ) : (
-                        <div className="text-[11px] text-slate-400 flex items-center space-x-1">
-                          <ImageIcon className="w-3.5 h-3.5" />
-                          <span>No receipt photo</span>
-                        </div>
-                      )}
-
-                      {/* Admin Decision Action Buttons */}
-                      {dep.status === 'pending' ? (
-                        <div className="flex flex-wrap items-center gap-2">
-                          <button
-                            type="button"
-                            disabled={Boolean(isProcessingDepositAction)}
-                            onClick={() => handleAdminVerifyDeposit(dep.id)}
-                            className="py-2 px-3 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 disabled:opacity-50 text-slate-800 dark:text-slate-200 font-bold transition cursor-pointer flex items-center space-x-1 border border-slate-200 dark:border-slate-700"
-                            title="Query live BNB Smart Chain RPC node for this deposit tx"
-                          >
-                            {isProcessingDepositAction === dep.id ? (
-                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                            ) : (
-                              <RefreshCw className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
-                            )}
-                            <span>Verify on BSC</span>
-                          </button>
-                          <button
-                            disabled={Boolean(isProcessingDepositAction)}
-                            onClick={() => setSelectedDepositForAction({ deposit: dep, action: 'confirmed' })}
-                            className="py-2 px-3.5 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold transition shadow-sm cursor-pointer flex items-center space-x-1"
-                          >
-                            {isProcessingDepositAction === dep.id ? (
-                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                            ) : (
-                              <Check className="w-3.5 h-3.5" />
-                            )}
-                            <span>Approve & Credit</span>
-                          </button>
-                          <button
-                            disabled={Boolean(isProcessingDepositAction)}
-                            onClick={() => setSelectedDepositForAction({ deposit: dep, action: 'rejected' })}
-                            className="py-2 px-3.5 rounded-xl bg-rose-50 dark:bg-rose-950/40 hover:bg-rose-100 dark:hover:bg-rose-900/50 disabled:opacity-50 disabled:cursor-not-allowed text-rose-600 dark:text-rose-400 border border-rose-200 dark:border-rose-800/60 font-bold transition cursor-pointer flex items-center space-x-1"
-                          >
-                            <X className="w-3.5 h-3.5" />
-                            <span>Reject</span>
-                          </button>
-                        </div>
-                      ) : (
-                        <div className="text-right space-y-0.5">
-                          <span className="text-[11px] font-bold block text-blue-600 dark:text-blue-400">
-                            {dep.status === 'confirmed' ? '✓ Credited to Balance' : '✕ Rejected'}
-                          </span>
-                          {dep.blockNumber && (
-                            <span className="text-[10px] text-slate-400 block font-mono">
-                              Block #{dep.blockNumber}
-                            </span>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </div>
+        <AdminDepositsView onRefreshParentStats={loadAllAdminData} />
       )}
 
-      {/* TAB 2: USERS */}
+      {/* TAB 2: USERS (STEP 12) */}
       {activeTab === 'users' && (
-        <div className="space-y-3">
-          <h2 className="text-sm font-bold text-slate-900 dark:text-white uppercase tracking-wider">
-            Registered Users & Accounts ({users.length})
-          </h2>
-          <div className="space-y-2">
-            {users.map(u => (
-              <div
-                key={u.id}
-                className="p-4 rounded-2xl bg-white dark:bg-[#0F172A] border border-slate-200 dark:border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-sm"
-              >
-                <div className="flex items-center space-x-3">
-                  <img
-                    src={u.profilePictureUrl || `https://api.dicebear.com/7.x/avataaars/svg?seed=${u.fullName}`}
-                    alt="avatar"
-                    className="w-10 h-10 rounded-xl object-cover border border-slate-200 dark:border-slate-700"
-                  />
-                  <div>
-                    <div className="flex items-center space-x-2">
-                      <span className="font-bold text-slate-900 dark:text-white text-sm">{u.fullName}</span>
-                      <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300">
-                        {u.role}
-                      </span>
-                      <span
-                        className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
-                          u.status === 'active'
-                            ? 'bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300'
-                            : 'bg-red-50 dark:bg-red-950/40 text-red-700 dark:text-red-300'
-                        }`}
-                      >
-                        {u.status}
-                      </span>
-                    </div>
-                    <p className="text-[11px] text-slate-500 dark:text-slate-400">{u.email} • {u.country}</p>
-                    <p className="text-[10px] text-slate-400 dark:text-slate-500">
-                      Created: {new Date(u.createdAt).toLocaleDateString()} ({u.balance?.accountAgeDays || 0}d age)
-                    </p>
-                  </div>
-                </div>
-
-                <div className="flex items-center space-x-4">
-                  <div className="text-right">
-                    <p className="text-sm font-bold text-slate-900 dark:text-white">
-                      ${Number(u.balance?.availableBalance || 0).toFixed(2)} USDT
-                    </p>
-                    <p className="text-[10px] text-slate-500 dark:text-slate-400">
-                      Deposited: ${Number(u.balance?.totalDeposited || 0).toFixed(2)}
-                    </p>
-                  </div>
-
-                  <button
-                    onClick={() => handleToggleUserStatus(u.id, u.status)}
-                    className={`py-1.5 px-3 rounded-lg font-bold transition text-[11px] cursor-pointer ${
-                      u.status === 'active'
-                        ? 'bg-red-50 dark:bg-red-950/40 hover:bg-red-100 dark:hover:bg-red-900/50 text-red-600 dark:text-red-400 border border-red-200 dark:border-red-800/60'
-                        : 'bg-blue-50 dark:bg-blue-950/40 hover:bg-blue-100 dark:hover:bg-blue-900/50 text-blue-600 dark:text-blue-400 border border-blue-200 dark:border-blue-800/60'
-                    }`}
-                  >
-                    {u.status === 'active' ? 'Suspend' : 'Activate'}
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
+        <AdminUsersView onRefreshParentStats={loadAllAdminData} />
       )}
 
       {/* TAB 3: WITHDRAWALS */}
       {activeTab === 'withdrawals' && (
-        <div className="space-y-3">
-          <h2 className="text-sm font-bold text-slate-900 dark:text-white uppercase tracking-wider">
-            Withdrawal Management & Payouts ({withdrawals.length})
-          </h2>
-
-          {withdrawals.length === 0 ? (
-            <div className="p-8 text-center rounded-2xl bg-white dark:bg-[#0F172A] border border-slate-200 dark:border-slate-800 text-slate-500 dark:text-slate-400">
-              No withdrawal requests.
-            </div>
-          ) : (
-            <div className="space-y-2">
-              {withdrawals.map(wd => (
-                <div
-                  key={wd.id}
-                  className="p-4 rounded-2xl bg-white dark:bg-[#0F172A] border border-slate-200 dark:border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-sm"
-                >
-                  <div className="space-y-1">
-                    <div className="flex items-center space-x-2">
-                      <span className="font-bold text-slate-900 dark:text-white text-sm">
-                        ${Number(wd.requestedAmount || 0).toFixed(2)} USDT
-                      </span>
-                      <span
-                        className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                          wd.status === 'paid'
-                            ? 'bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300'
-                            : wd.status === 'rejected'
-                            ? 'bg-red-50 dark:bg-red-950/40 text-red-700 dark:text-red-300'
-                            : 'bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300'
-                        }`}
-                      >
-                        {String(wd.status || 'pending').toUpperCase()}
-                      </span>
-                      <span className="text-[11px] text-slate-500 dark:text-slate-400">
-                        Net: ${Number(wd.netAmount || 0).toFixed(2)} ({wd.feePercentage ?? appSettings?.withdrawalFeePercentage ?? 6}% Fee: ${Number(wd.feeAmount || 0).toFixed(2)})
-                      </span>
-                    </div>
-
-                    <p className="text-[11px] text-slate-700 dark:text-slate-300 font-mono break-all">
-                      To: {wd.destinationAddress}
-                    </p>
-                    <p className="text-[10px] text-slate-400 dark:text-slate-500">
-                      User: {wd.userId} • Ref: {wd.reference} • {new Date(wd.createdAt).toLocaleString()}
-                    </p>
-                  </div>
-
-                  {wd.status === 'pending' || wd.status === 'under_review' ? (
-                    <div className="flex items-center space-x-2">
-                      <button
-                        disabled={Boolean(isProcessingWithdrawalAction)}
-                        onClick={() => {
-                          setSelectedWithdrawal(wd);
-                          setPayoutTxHash('');
-                          setAdminNote('');
-                        }}
-                        className="py-1.5 px-3.5 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold transition shadow-sm cursor-pointer"
-                      >
-                        Pay / Complete
-                      </button>
-                      <button
-                        disabled={Boolean(isProcessingWithdrawalAction)}
-                        onClick={() => handleWithdrawalAction(wd.id, 'rejected')}
-                        className="py-1.5 px-3.5 rounded-xl bg-red-50 dark:bg-red-950/40 hover:bg-red-100 dark:hover:bg-red-900/50 disabled:opacity-50 disabled:cursor-not-allowed text-red-600 dark:text-red-400 border border-red-200 dark:border-red-800/60 font-bold transition cursor-pointer flex items-center space-x-1"
-                      >
-                        {isProcessingWithdrawalAction === wd.id ? (
-                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                        ) : null}
-                        <span>Reject & Refund</span>
-                      </button>
-                    </div>
-                  ) : (
-                    <div className="text-right">
-                      {wd.txHash && (
-                        <p className="text-[10px] text-blue-600 dark:text-blue-400 font-mono">Tx: {wd.txHash.substring(0, 10)}...</p>
-                      )}
-                      <p className="text-[10px] text-slate-400 dark:text-slate-500">{wd.status === 'paid' ? 'Paid on Chain' : 'Resolved'}</p>
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* Payout Completion Modal */}
-      {selectedWithdrawal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm">
-          <div className="w-full max-w-md p-6 rounded-3xl bg-white dark:bg-[#0F172A] border border-slate-200 dark:border-slate-800 space-y-4 shadow-2xl">
-            <h3 className="text-sm font-bold text-slate-900 dark:text-white uppercase">
-              Complete BEP-20 Payout ({selectedWithdrawal.reference})
-            </h3>
-            <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-300 space-y-1 text-xs">
-              <p>Net Payout Amount: <strong className="text-blue-600 dark:text-blue-400 font-bold">${Number(selectedWithdrawal.netAmount || 0).toFixed(2)} USDT</strong></p>
-              <p className="font-mono text-[10px] break-all text-slate-500 dark:text-slate-400">Destination: {selectedWithdrawal.destinationAddress}</p>
-            </div>
-
-            <div>
-              <label className="block text-slate-700 dark:text-slate-300 mb-1 text-xs font-semibold">
-                BNB Smart Chain Payout Tx Hash <span className="text-rose-500 font-bold">*Required</span>
-              </label>
-              <input
-                type="text"
-                required
-                value={payoutTxHash}
-                onChange={e => setPayoutTxHash(e.target.value)}
-                placeholder="0x... (TxID from BSC on-chain transfer)"
-                className="w-full py-2.5 px-3 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-white font-mono text-xs focus:outline-none focus:border-blue-600"
-              />
-              {!payoutTxHash.trim() && (
-                <p className="text-[11px] text-rose-500 mt-1">Transaction hash is required for user confirmation & blockchain verification.</p>
-              )}
-            </div>
-
-            <div>
-              <label className="block text-slate-500 dark:text-slate-400 mb-1 text-xs font-medium">Admin Internal Note (Optional)</label>
-              <input
-                type="text"
-                value={adminNote}
-                onChange={e => setAdminNote(e.target.value)}
-                placeholder="e.g. Paid via corporate Binance / BSC wallet"
-                className="w-full py-2.5 px-3 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-slate-900 dark:text-white text-xs"
-              />
-            </div>
-
-            <div className="flex space-x-2 pt-2">
-              <button
-                disabled={Boolean(isProcessingWithdrawalAction) || !payoutTxHash.trim()}
-                onClick={() => handleWithdrawalAction(selectedWithdrawal.id, 'paid', payoutTxHash)}
-                className="flex-1 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold text-xs transition cursor-pointer shadow-md shadow-blue-500/20 flex items-center justify-center space-x-1.5"
-              >
-                {isProcessingWithdrawalAction === selectedWithdrawal.id ? (
-                  <>
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                    <span>Processing Payout...</span>
-                  </>
-                ) : (
-                  <span>Mark as Paid & Notify User</span>
-                )}
-              </button>
-              <button
-                disabled={Boolean(isProcessingWithdrawalAction)}
-                onClick={() => setSelectedWithdrawal(null)}
-                className="py-2.5 px-4 rounded-xl bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-semibold text-xs transition cursor-pointer"
-              >
-                Cancel
-              </button>
-            </div>
-          </div>
-        </div>
+        <AdminWithdrawalsView onRefreshParentStats={loadAllAdminData} />
       )}
 
       {/* Deposit Receipt Preview Fullscreen Modal */}

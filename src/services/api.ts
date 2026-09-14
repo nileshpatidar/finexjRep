@@ -1,15 +1,30 @@
 import {
   DashboardResponse,
   DepositItem,
+  AdminDepositDetailResponse,
   WithdrawalItem,
+  AdminWithdrawalsListResponse,
+  AdminWithdrawalDetailResponse,
+  PayoutVerificationResponse,
   EarningItem,
   LedgerItem,
   MarketPrice,
+  MarketTickerResponse,
   AppSettings,
   TestSuiteResponse,
   UserProfile,
   SystemHealthStats,
   SystemLogItem,
+  AdminAccountingSummary,
+  FinexjOperationalSummary,
+  ReferralAccountingSummary,
+  AdminLedgerResponse,
+  UserReferralSummary,
+  PaginatedLevel1ReferralsResponse,
+  PaginatedLevel2ReferralsResponse,
+  WithdrawalImpactResult,
+  UserBalanceSummary,
+  TransactionsResponse,
 } from '../types';
 
 const API_BASE = '';
@@ -102,19 +117,56 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
-  getEarnings: () => request<{ earnings: EarningItem[]; totalEarnings: number }>('/api/user/earnings'),
+  getEarnings: (params?: { page?: number; pageSize?: number }) => {
+    const query = new URLSearchParams();
+    if (params?.page !== undefined) query.set('page', String(params.page));
+    if (params?.pageSize !== undefined) query.set('pageSize', String(params.pageSize));
+    const qs = query.toString();
+    return request<{
+      earnings: EarningItem[];
+      totalEarnings: number;
+      page: number;
+      pageSize: number;
+      hasMore: boolean;
+      totalCount?: number;
+    }>(`/api/user/earnings${qs ? `?${qs}` : ''}`);
+  },
 
-  getWithdrawals: () => request<{ withdrawals: WithdrawalItem[]; balance: any }>('/api/user/withdrawals'),
+  getWithdrawals: () => request<{ withdrawals: WithdrawalItem[]; balance: UserBalanceSummary }>('/api/user/withdrawals'),
+
+  previewWithdrawal: (requestedAmount: number) =>
+    request<{ success: boolean; impact: WithdrawalImpactResult }>('/api/user/withdrawals/preview', {
+      method: 'POST',
+      body: JSON.stringify({ requestedAmount }),
+    }),
+
+  requestWithdrawalOtp: () =>
+    request<{ success: boolean; message: string; expiresInSeconds?: number; testOtpCode?: string }>('/api/user/withdrawals/request-otp', {
+      method: 'POST',
+    }),
 
   submitWithdrawal: (payload: {
     requestedAmount: number;
     destinationAddress: string;
+    network?: string;
     password: string;
     twoFactorCode?: string;
+    otpCode?: string;
+    confirmCompoundingImpact?: boolean;
+    confirmLockBreak?: boolean;
+    confirmMinimumBreak?: boolean;
     idempotencyKey?: string;
     userNotes?: string;
   }) =>
-    request<{ success: boolean; withdrawal: WithdrawalItem; balance: any }>('/api/user/withdrawals', {
+    request<{
+      success: boolean;
+      withdrawal?: WithdrawalItem;
+      balance?: UserBalanceSummary;
+      requiresOtp?: boolean;
+      requiresConfirmation?: boolean;
+      warningType?: 'COMPOUNDING_NOTICE' | 'LOCK_BREAK_WARNING' | 'MINIMUM_FUND_WARNING';
+      error?: string;
+    }>('/api/user/withdrawals', {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
@@ -125,11 +177,33 @@ export const api = {
       body: JSON.stringify({ days, reason }),
     }),
 
-  getTransactions: () => request<{ transactions: LedgerItem[] }>('/api/user/transactions'),
+  getTransactions: (params?: {
+    page?: number;
+    limit?: number;
+    type?: string;
+    status?: string;
+    search?: string;
+    startDate?: string;
+    endDate?: string;
+  }) => {
+    const query = new URLSearchParams();
+    if (params?.page) query.set('page', String(params.page));
+    if (params?.limit) query.set('limit', String(params.limit));
+    if (params?.type && params.type !== 'all') query.set('type', params.type);
+    if (params?.status && params.status !== 'all') query.set('status', params.status);
+    if (params?.search) query.set('search', params.search);
+    if (params?.startDate) query.set('startDate', params.startDate);
+    if (params?.endDate) query.set('endDate', params.endDate);
+    const qs = query.toString();
+    return request<TransactionsResponse>(`/api/user/transactions${qs ? `?${qs}` : ''}`);
+  },
 
   getSettings: () => request<AppSettings>('/api/settings'),
 
   getMarketPrices: () => request<MarketPrice>('/api/market/prices'),
+
+  getMarketTicker: (refresh?: boolean) =>
+    request<MarketTickerResponse>(`/api/market/ticker${refresh ? '?refresh=true' : ''}`),
 
   verifyUserDeposit: (depositId: string) =>
     request<{ success: boolean; deposit?: DepositItem; balance: any; isPendingConfirmations?: boolean; confirmations?: number; requiredConfirmations?: number; message?: string; error?: string }>(
@@ -147,13 +221,98 @@ export const api = {
 
   // Admin
   getAdminDashboard: () => request<any>('/api/admin/dashboard'),
-  getAdminUsers: () => request<{ users: any[] }>('/api/admin/users'),
-  updateUserStatus: (userId: string, status: string) =>
+  getAdminUsers: (params?: {
+    page?: number;
+    limit?: number;
+    search?: string;
+    status?: string;
+    isTestUser?: string | boolean;
+    role?: string;
+  }) => {
+    const query = new URLSearchParams();
+    if (params?.page) query.set('page', String(params.page));
+    if (params?.limit) query.set('limit', String(params.limit));
+    if (params?.search) query.set('search', params.search);
+    if (params?.status && params.status !== 'all') query.set('status', params.status);
+    if (params?.isTestUser !== undefined && params.isTestUser !== 'all') query.set('isTestUser', String(params.isTestUser));
+    if (params?.role && params.role !== 'all') query.set('role', params.role);
+    const qs = query.toString();
+    return request<{
+      users: any[];
+      pagination?: {
+        page: number;
+        limit: number;
+        total: number;
+        totalPages: number;
+      };
+    }>(`/api/admin/users${qs ? `?${qs}` : ''}`);
+  },
+  getAdminUserDetail: (userId: string) =>
+    request<{
+      success: boolean;
+      user: any;
+      referrer?: any;
+      balance: any;
+      referralDetails: any;
+      history: {
+        deposits: any[];
+        withdrawals: any[];
+        earnings: any[];
+        referralRewards: any[];
+        ledger: any[];
+        auditLogs: any[];
+      };
+    }>(`/api/admin/users/${userId}`),
+  updateUserStatus: (userId: string, status: string, reason?: string) =>
     request<{ success: boolean; user: any }>(`/api/admin/users/${userId}/status`, {
       method: 'POST',
-      body: JSON.stringify({ status }),
+      body: JSON.stringify({ status, reason }),
     }),
-  getAdminDeposits: () => request<{ deposits: DepositItem[] }>('/api/admin/deposits'),
+  updateUserTestStatus: (userId: string, isTestUser: boolean, reason?: string) =>
+    request<{ success: boolean; user: any; isTestUser: boolean }>(`/api/admin/users/${userId}/test-user`, {
+      method: 'POST',
+      body: JSON.stringify({ isTestUser, reason }),
+    }),
+  updateUserFundLock: (userId: string, action: 'lock' | 'unlock', days?: number, reason?: string) =>
+    request<{ success: boolean; user: any }>(`/api/admin/users/${userId}/fund-lock`, {
+      method: 'POST',
+      body: JSON.stringify({ action, days, reason }),
+    }),
+  getAdminDeposits: (params?: {
+    page?: number;
+    limit?: number;
+    status?: string;
+    search?: string;
+    txHash?: string;
+    minAmount?: number;
+    maxAmount?: number;
+    startDate?: string;
+    endDate?: string;
+  }) => {
+    const query = new URLSearchParams();
+    if (params?.page) query.set('page', String(params.page));
+    if (params?.limit) query.set('limit', String(params.limit));
+    if (params?.status && params.status !== 'all') query.set('status', params.status);
+    if (params?.search) query.set('search', params.search);
+    if (params?.txHash) query.set('txHash', params.txHash);
+    if (params?.minAmount !== undefined && !isNaN(params.minAmount)) query.set('minAmount', String(params.minAmount));
+    if (params?.maxAmount !== undefined && !isNaN(params.maxAmount)) query.set('maxAmount', String(params.maxAmount));
+    if (params?.startDate) query.set('startDate', params.startDate);
+    if (params?.endDate) query.set('endDate', params.endDate);
+    const qs = query.toString();
+    return request<{
+      deposits: DepositItem[];
+      pagination?: {
+        page: number;
+        limit: number;
+        total: number;
+        totalPages: number;
+      };
+      minimumDepositAmount?: number;
+    }>(`/api/admin/deposits${qs ? `?${qs}` : ''}`);
+  },
+  getAdminDepositDetail: (depositId: string) =>
+    request<AdminDepositDetailResponse>(`/api/admin/deposits/${depositId}`),
   verifyAdminDeposit: (depositId: string) =>
     request<{ success: boolean; deposit?: DepositItem; isPendingConfirmations?: boolean; confirmations?: number; requiredConfirmations?: number; message?: string; error?: string }>(
       `/api/admin/deposits/${depositId}/verify`,
@@ -164,8 +323,43 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
-  getAdminWithdrawals: () => request<{ withdrawals: WithdrawalItem[] }>('/api/admin/withdrawals'),
-  updateWithdrawalAction: (withdrawalId: string, payload: { action: string; txHash?: string; adminNotes?: string }) =>
+  getAdminWithdrawals: (params?: {
+    page?: number;
+    limit?: number;
+    status?: string;
+    search?: string;
+    walletAddress?: string;
+    txHash?: string;
+    minAmount?: number;
+    maxAmount?: number;
+    startDate?: string;
+    endDate?: string;
+  }) => {
+    const query = new URLSearchParams();
+    if (params?.page) query.set('page', String(params.page));
+    if (params?.limit) query.set('limit', String(params.limit));
+    if (params?.status && params.status !== 'all') query.set('status', params.status);
+    if (params?.search) query.set('search', params.search);
+    if (params?.walletAddress) query.set('walletAddress', params.walletAddress);
+    if (params?.txHash) query.set('txHash', params.txHash);
+    if (params?.minAmount !== undefined && !isNaN(params.minAmount)) query.set('minAmount', String(params.minAmount));
+    if (params?.maxAmount !== undefined && !isNaN(params.maxAmount)) query.set('maxAmount', String(params.maxAmount));
+    if (params?.startDate) query.set('startDate', params.startDate);
+    if (params?.endDate) query.set('endDate', params.endDate);
+    const qs = query.toString();
+    return request<AdminWithdrawalsListResponse>(`/api/admin/withdrawals${qs ? `?${qs}` : ''}`);
+  },
+  getAdminWithdrawalById: (withdrawalId: string) =>
+    request<AdminWithdrawalDetailResponse>(`/api/admin/withdrawals/${withdrawalId}`),
+  verifyAdminWithdrawalPayout: (withdrawalId: string, payload: { txHash: string }) =>
+    request<PayoutVerificationResponse>(`/api/admin/withdrawals/${withdrawalId}/verify-payout`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  updateWithdrawalAction: (
+    withdrawalId: string,
+    payload: { action: string; txHash?: string; adminNotes?: string; reason?: string }
+  ) =>
     request<{ success: boolean; withdrawal: WithdrawalItem }>(`/api/admin/withdrawals/${withdrawalId}/action`, {
       method: 'POST',
       body: JSON.stringify(payload),
@@ -237,4 +431,87 @@ export const api = {
     request<{ success: boolean; report: any }>('/api/admin/health/cleanup', {
       method: 'POST',
     }),
+
+  // FINEXJ Accounting & Operational Fund (Step 5)
+  getAccountingSummary: (params?: { period?: string; startDate?: string; endDate?: string }) => {
+    const query = new URLSearchParams();
+    if (params?.period) query.set('period', params.period);
+    if (params?.startDate) query.set('startDate', params.startDate);
+    if (params?.endDate) query.set('endDate', params.endDate);
+    return request<{ success: boolean; accounting: AdminAccountingSummary }>(`/api/admin/accounting/summary?${query.toString()}`);
+  },
+
+  getOperationalFundSummary: () =>
+    request<{ success: boolean; summary: FinexjOperationalSummary }>('/api/admin/operational-fund'),
+
+  adjustOperationalFund: (payload: { amount: number; direction: 'inflow' | 'outflow'; reason: string; reference?: string }) =>
+    request<{ success: boolean; entry: any; message: string }>('/api/admin/operational-fund/adjust', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  getReferralAccounting: () =>
+    request<{ success: boolean; referralAccounting: ReferralAccountingSummary }>('/api/admin/accounting/referrals'),
+
+  getAdminLedger: (params?: {
+    page?: number;
+    limit?: number;
+    type?: string;
+    userId?: string;
+    reference?: string;
+    startDate?: string;
+    endDate?: string;
+    minAmount?: number;
+    maxAmount?: number;
+  }) => {
+    const query = new URLSearchParams();
+    if (params?.page) query.set('page', String(params.page));
+    if (params?.limit) query.set('limit', String(params.limit));
+    if (params?.type) query.set('type', params.type);
+    if (params?.userId) query.set('userId', params.userId);
+    if (params?.reference) query.set('reference', params.reference);
+    if (params?.startDate) query.set('startDate', params.startDate);
+    if (params?.endDate) query.set('endDate', params.endDate);
+    if (params?.minAmount !== undefined) query.set('minAmount', String(params.minAmount));
+    if (params?.maxAmount !== undefined) query.set('maxAmount', String(params.maxAmount));
+    return request<{ success: boolean } & AdminLedgerResponse>(`/api/admin/accounting/ledger?${query.toString()}`);
+  },
+
+  // User Referral Dashboard APIs
+  getUserReferralSummary: () =>
+    request<{ success: boolean; summary: UserReferralSummary }>('/api/referrals/summary'),
+
+  checkReferralEligibility: () =>
+    request<{
+      success: boolean;
+      eligibility: {
+        isEligible: boolean;
+        hasConfirmedDeposit: boolean;
+        totalDeposited: number;
+        totalWithdrawn: number;
+        maintainedEligiblePrincipal: number;
+        minimumRequiredPrincipal: number;
+        reason?: string;
+      };
+    }>('/api/referrals/eligibility'),
+
+  getLevel1Referrals: (page: number = 1, limit: number = 10) =>
+    request<{ success: boolean; data: PaginatedLevel1ReferralsResponse }>(
+      `/api/referrals/level1?page=${page}&limit=${limit}`
+    ),
+
+  getLevel2Referrals: (params?: { level1UserId?: string; page?: number; limit?: number }) => {
+    const query = new URLSearchParams();
+    if (params?.level1UserId) query.set('level1UserId', params.level1UserId);
+    if (params?.page) query.set('page', String(params.page));
+    if (params?.limit) query.set('limit', String(params.limit));
+    return request<{ success: boolean; data: PaginatedLevel2ReferralsResponse }>(
+      `/api/referrals/level2?${query.toString()}`
+    );
+  },
+
+  validateReferralCode: (code: string) =>
+    request<{ success: boolean; valid: boolean; referrerName?: string; error?: string }>(
+      `/api/referrals/validate/${encodeURIComponent(code)}`
+    ),
 };

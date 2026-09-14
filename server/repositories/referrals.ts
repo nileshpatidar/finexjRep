@@ -1,0 +1,556 @@
+import { getServerSupabase, isServerSupabaseReady } from '../supabase';
+import { Referral, ReferralReward } from '../types';
+import { resolveUserIdForDb } from './profiles';
+import { config } from '../config';
+
+export function mapDbReferral(r: any): Referral {
+  return {
+    id: String(r.id),
+    referrerId: String(r.referrer_id),
+    referredId: String(r.referred_id),
+    referralCodeUsed: r.referral_code_used || undefined,
+    status: r.status || 'active',
+    createdAt: r.created_at || new Date().toISOString(),
+  };
+}
+
+export function mapDbReferralReward(rw: any): ReferralReward {
+  return {
+    id: String(rw.id),
+    referralId: rw.referral_id ? String(rw.referral_id) : undefined,
+    referrerId: String(rw.referrer_id),
+    referredId: String(rw.referred_id),
+    depositId: String(rw.deposit_id),
+    amount: Number(rw.amount) || 0,
+    percentage: Number(rw.percentage) || 0,
+    reference: rw.reference,
+    status: rw.status || 'credited',
+    rewardLevel: rw.reward_level || (rw.reference?.includes('L2') ? 2 : 1),
+    notes: rw.notes || undefined,
+    createdAt: rw.created_at || new Date().toISOString(),
+  };
+}
+
+export async function getReferralByReferredId(referredId: string): Promise<Referral | null> {
+  if (!isServerSupabaseReady()) return null;
+
+  try {
+    const supabase = getServerSupabase();
+    const dbReferredId = await resolveUserIdForDb(referredId);
+
+    const { data, error } = await supabase
+      .from('referrals')
+      .select('*')
+      .eq('referred_id', dbReferredId)
+      .maybeSingle();
+
+    if (error || !data) return null;
+    return mapDbReferral(data);
+  } catch (err: any) {
+    console.warn(`[Supabase Exception] getReferralByReferredId(${referredId}):`, err?.message);
+    return null;
+  }
+}
+
+export async function getReferralsByReferrerId(referrerId: string): Promise<Referral[]> {
+  if (!isServerSupabaseReady()) return [];
+
+  try {
+    const supabase = getServerSupabase();
+    const dbReferrerId = await resolveUserIdForDb(referrerId);
+
+    const { data, error } = await supabase
+      .from('referrals')
+      .select('*')
+      .eq('referrer_id', dbReferrerId)
+      .order('created_at', { ascending: false });
+
+    if (error || !data) return [];
+    return data.map(mapDbReferral);
+  } catch (err: any) {
+    console.warn(`[Supabase Exception] getReferralsByReferrerId(${referrerId}):`, err?.message);
+    return [];
+  }
+}
+
+export async function getReferralsByReferrerIdPaginated(
+  referrerId: string,
+  page: number = 1,
+  limit: number = 10
+): Promise<{ referrals: Referral[]; total: number }> {
+  if (!isServerSupabaseReady()) return { referrals: [], total: 0 };
+
+  try {
+    const supabase = getServerSupabase();
+    const dbReferrerId = await resolveUserIdForDb(referrerId);
+    const safePage = Math.max(1, page);
+    const safeLimit = Math.max(1, Math.min(limit, 100));
+    const offset = (safePage - 1) * safeLimit;
+
+    const { data, count, error } = await supabase
+      .from('referrals')
+      .select('*', { count: 'exact' })
+      .eq('referrer_id', dbReferrerId)
+      .order('created_at', { ascending: false })
+      .range(offset, offset + safeLimit - 1);
+
+    if (error || !data) return { referrals: [], total: 0 };
+    return {
+      referrals: data.map(mapDbReferral),
+      total: count !== null && count !== undefined ? count : data.length,
+    };
+  } catch (err: any) {
+    console.warn(`[Supabase Exception] getReferralsByReferrerIdPaginated(${referrerId}):`, err?.message);
+    return { referrals: [], total: 0 };
+  }
+}
+
+export async function getReferralsCountByReferrerId(referrerId: string): Promise<number> {
+  if (!isServerSupabaseReady()) return 0;
+
+  try {
+    const supabase = getServerSupabase();
+    const dbReferrerId = await resolveUserIdForDb(referrerId);
+
+    const { count, error } = await supabase
+      .from('referrals')
+      .select('*', { count: 'exact', head: true })
+      .eq('referrer_id', dbReferrerId);
+
+    if (error) return 0;
+    return count || 0;
+  } catch {
+    return 0;
+  }
+}
+
+export async function getRewardsSumForReferredUser(referrerId: string, referredId: string): Promise<number> {
+  try {
+    const supabase = getServerSupabase();
+    const dbReferrerId = await resolveUserIdForDb(referrerId);
+    const dbReferredId = await resolveUserIdForDb(referredId);
+
+    const { data, error } = await supabase
+      .from('referral_rewards')
+      .select('amount')
+      .eq('referrer_id', dbReferrerId)
+      .eq('referred_id', dbReferredId)
+      .eq('status', 'credited');
+
+    if (error || !data) return 0;
+    return Number(data.reduce((acc: number, item: any) => acc + (Number(item.amount) || 0), 0).toFixed(4));
+  } catch {
+    return 0;
+  }
+}
+
+export async function createReferralRelationship(
+  referrerId: string,
+  referredId: string,
+  referralCodeUsed?: string
+): Promise<Referral> {
+  const supabase = getServerSupabase();
+  const dbReferrerId = await resolveUserIdForDb(referrerId);
+  const dbReferredId = await resolveUserIdForDb(referredId);
+
+  // Self-referral validation
+  if (String(dbReferrerId) === String(dbReferredId)) {
+    throw new Error('Self-referral is strictly prohibited.');
+  }
+
+  // Check if referred user already has an established referrer
+  const existing = await getReferralByReferredId(referredId);
+  if (existing) {
+    return existing; // Immutable once established
+  }
+
+  const payload = {
+    referrer_id: dbReferrerId,
+    referred_id: dbReferredId,
+    referral_code_used: referralCodeUsed || null,
+    status: 'active',
+    created_at: new Date().toISOString(),
+  };
+
+  const { data, error } = await supabase
+    .from('referrals')
+    .insert(payload)
+    .select()
+    .single();
+
+  if (error) {
+    console.warn('[Supabase Warn] createReferralRelationship:', error.message);
+    // If conflict, return existing
+    const fallback = await getReferralByReferredId(referredId);
+    if (fallback) return fallback;
+    throw new Error(`Failed to bind referral relationship: ${error.message}`);
+  }
+
+  return mapDbReferral(data);
+}
+
+export async function getReferralRewardByDepositId(depositId: string | number): Promise<ReferralReward | null> {
+  try {
+    const supabase = getServerSupabase();
+    const dbDepositId = !isNaN(Number(depositId)) ? Number(depositId) : depositId;
+
+    const { data, error } = await supabase
+      .from('referral_rewards')
+      .select('*')
+      .eq('deposit_id', dbDepositId)
+      .limit(1)
+      .maybeSingle();
+
+    if (error || !data) return null;
+    return mapDbReferralReward(data);
+  } catch (err: any) {
+    console.warn(`[Supabase Exception] getReferralRewardByDepositId(${depositId}):`, err?.message);
+    return null;
+  }
+}
+
+export async function getReferralRewardsByDepositId(depositId: string | number): Promise<ReferralReward[]> {
+  try {
+    const supabase = getServerSupabase();
+    const dbDepositId = !isNaN(Number(depositId)) ? Number(depositId) : depositId;
+
+    const { data, error } = await supabase
+      .from('referral_rewards')
+      .select('*')
+      .eq('deposit_id', dbDepositId);
+
+    if (error || !data) return [];
+    return data.map(mapDbReferralReward);
+  } catch (err: any) {
+    console.warn(`[Supabase Exception] getReferralRewardsByDepositId(${depositId}):`, err?.message);
+    return [];
+  }
+}
+
+export async function getReferralRewardByDepositAndLevel(
+  depositId: string | number,
+  rewardLevel: number
+): Promise<ReferralReward | null> {
+  if (!isServerSupabaseReady()) {
+    return null;
+  }
+
+  try {
+    const supabase = getServerSupabase();
+    const dbDepositId = !isNaN(Number(depositId)) ? Number(depositId) : depositId;
+
+    const { data, error } = await supabase
+      .from('referral_rewards')
+      .select('*')
+      .eq('deposit_id', dbDepositId)
+      .eq('reward_level', rewardLevel)
+      .maybeSingle();
+
+    if (!error && data) return mapDbReferralReward(data);
+  } catch (err: any) {
+    console.warn(`[Supabase Exception] getReferralRewardByDepositAndLevel(${depositId}, ${rewardLevel}):`, err?.message);
+  }
+
+  return null;
+}
+
+export class DuplicateReferralRewardError extends Error {
+  public readonly depositId: string | number;
+  public readonly rewardLevel: number;
+  constructor(depositId: string | number, rewardLevel: number, message?: string) {
+    super(message || `Referral reward for deposit #${depositId} at level ${rewardLevel} already exists.`);
+    this.name = 'DuplicateReferralRewardError';
+    this.depositId = depositId;
+    this.rewardLevel = rewardLevel;
+  }
+}
+
+export async function createReferralReward(reward: Partial<ReferralReward>): Promise<ReferralReward> {
+  const supabase = getServerSupabase();
+  const dbReferrerId = await resolveUserIdForDb(reward.referrerId);
+  const dbReferredId = await resolveUserIdForDb(reward.referredId);
+  const dbDepositId = !isNaN(Number(reward.depositId)) ? Number(reward.depositId) : reward.depositId;
+  const rewardLevel = reward.rewardLevel || (reward.reference?.includes('L2') ? 2 : 1);
+
+  if (String(dbReferrerId) === String(dbReferredId)) {
+    throw new Error('Cannot reward self-referral.');
+  }
+
+  // Pre-check for existing reward at this level
+  const existing = await getReferralRewardByDepositAndLevel(dbDepositId, rewardLevel);
+  if (existing) {
+    throw new DuplicateReferralRewardError(dbDepositId, rewardLevel);
+  }
+
+  const payload = {
+    referral_id: reward.referralId ? (!isNaN(Number(reward.referralId)) ? Number(reward.referralId) : reward.referralId) : null,
+    referrer_id: dbReferrerId,
+    referred_id: dbReferredId,
+    deposit_id: dbDepositId,
+    amount: reward.amount || 0,
+    percentage: reward.percentage || 0,
+    reference: reward.reference || `REF-REW-${Date.now()}-${Math.random().toString(36).substring(2, 7).toUpperCase()}`,
+    status: reward.status || 'credited',
+    reward_level: rewardLevel,
+    event_type: 'qualifying_deposit',
+    notes: reward.notes || null,
+    created_at: reward.createdAt || new Date().toISOString(),
+  };
+
+  const { data, error } = await supabase
+    .from('referral_rewards')
+    .insert(payload)
+    .select()
+    .single();
+
+  if (error) {
+    if (error.code === '23505' || error.message.includes('unique') || error.message.includes('uq_referral_reward')) {
+      console.warn(`[Supabase Duplicate Reward Caught]: Deposit #${dbDepositId} Level ${rewardLevel}`);
+      throw new DuplicateReferralRewardError(dbDepositId, rewardLevel);
+    }
+
+    throw new Error(`[CRITICAL] Database error inserting referral reward: ${error.message}`);
+  }
+
+  return mapDbReferralReward(data);
+}
+
+export async function deleteReferralReward(id: string | number): Promise<boolean> {
+  try {
+    const supabase = getServerSupabase();
+    const { error } = await supabase.from('referral_rewards').delete().eq('id', id);
+    return !error;
+  } catch (err: any) {
+    console.warn(`[Supabase Exception] deleteReferralReward(${id}):`, err?.message);
+    return false;
+  }
+}
+
+export async function getReferralRewardsByReferrerId(referrerId: string): Promise<ReferralReward[]> {
+  try {
+    const supabase = getServerSupabase();
+    const dbReferrerId = await resolveUserIdForDb(referrerId);
+
+    const { data, error } = await supabase
+      .from('referral_rewards')
+      .select('*')
+      .eq('referrer_id', dbReferrerId)
+      .eq('status', 'credited')
+      .order('created_at', { ascending: false });
+
+    if (error || !data) return [];
+    return data.map(mapDbReferralReward);
+  } catch (err: any) {
+    console.warn(`[Supabase Exception] getReferralRewardsByReferrerId(${referrerId}):`, err?.message);
+    return [];
+  }
+}
+
+export async function getAllReferralRewards(options?: { limit?: number; offset?: number }): Promise<{
+  rewards: ReferralReward[];
+  total: number;
+}> {
+  try {
+    const supabase = getServerSupabase();
+    const limit = options?.limit || 500;
+    const offset = options?.offset || 0;
+
+    const { data, count, error } = await supabase
+      .from('referral_rewards')
+      .select('*', { count: 'exact' })
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (error || !data) {
+      return { rewards: [], total: 0 };
+    }
+
+    return {
+      rewards: data.map(mapDbReferralReward),
+      total: count || data.length,
+    };
+  } catch (err: any) {
+    console.warn('[Supabase Exception] getAllReferralRewards:', err?.message);
+    return { rewards: [], total: 0 };
+  }
+}
+
+export interface CreditReferralRewardInput {
+  depositId: string | number;
+  rewardLevel: 1 | 2;
+  referrerId: string | number;
+  referredId: string | number;
+  amount: number;
+  percentage: number;
+  reference?: string;
+  notes?: string;
+  referralId?: string | number;
+  performedBy?: string;
+}
+
+export interface CreditReferralRewardResult {
+  success: boolean;
+  isDuplicate?: boolean;
+  reward?: ReferralReward;
+  ledgerId?: number;
+  auditId?: number;
+  balanceAfter?: number;
+  error?: string;
+  message?: string;
+  ledgerCreatedInDb?: boolean;
+}
+
+/**
+ * STEP 14C — ATOMIC REFERRAL REWARD CREDIT
+ * Executes PostgreSQL RPC credit_referral_reward_atomic to ensure that:
+ * 1. referral_rewards INSERT
+ * 2. referral ledger INSERT (referral_reward_l1 / referral_reward_l2)
+ * 3. audit log INSERT
+ * succeed or fail together in a single transaction with row locking.
+ */
+const ongoingProcessingLocks = new Set<string>();
+
+export async function creditReferralRewardAtomic(
+  input: CreditReferralRewardInput
+): Promise<CreditReferralRewardResult> {
+  // Input validation invariants
+  if (input.rewardLevel !== 1 && input.rewardLevel !== 2) {
+    return {
+      success: false,
+      error: `Invalid reward level: ${input.rewardLevel}. Referral rewards are strictly restricted to Level 1 and Level 2.`,
+    };
+  }
+
+  if (input.amount <= 0 || input.percentage <= 0) {
+    return {
+      success: false,
+      error: 'Reward amount and percentage must be strictly positive.',
+    };
+  }
+
+  if (String(input.referrerId) === String(input.referredId)) {
+    return {
+      success: false,
+      error: 'Cannot reward self-referral.',
+    };
+  }
+
+  const dbDepositId = !isNaN(Number(input.depositId)) ? Number(input.depositId) : input.depositId;
+  const dbReferrerId = await resolveUserIdForDb(input.referrerId);
+  const dbReferredId = await resolveUserIdForDb(input.referredId);
+  const dbReferralId = input.referralId ? (!isNaN(Number(input.referralId)) ? Number(input.referralId) : null) : null;
+
+  // 1. Primary path: Atomic PostgreSQL Function Execution
+  if (isServerSupabaseReady()) {
+    try {
+      const supabase = getServerSupabase();
+      const { data: rpcData, error: rpcError } = await supabase.rpc('credit_referral_reward_atomic', {
+        p_deposit_id: dbDepositId,
+        p_reward_level: input.rewardLevel,
+        p_referrer_id: dbReferrerId,
+        p_referred_id: dbReferredId,
+        p_amount: input.amount,
+        p_percentage: input.percentage,
+        p_reference: input.reference || null,
+        p_notes: input.notes || null,
+        p_referral_id: dbReferralId,
+        p_performed_by: input.performedBy || 'referral_engine',
+      });
+
+      if (!rpcError && rpcData) {
+        if (rpcData.success) {
+          return {
+            success: true,
+            isDuplicate: !!rpcData.is_duplicate,
+            reward: rpcData.reward ? mapDbReferralReward(rpcData.reward) : undefined,
+            ledgerId: rpcData.ledger_id,
+            auditId: rpcData.audit_id,
+            balanceAfter: rpcData.balance_after,
+            ledgerCreatedInDb: true,
+            message: rpcData.message,
+          };
+        }
+        if (rpcData.error) {
+          return {
+            success: false,
+            error: rpcData.error,
+          };
+        }
+      }
+    } catch (rpcErr: any) {
+      console.warn('[Referral Atomic RPC Notice]: RPC call fell back to transactional repository handler:', rpcErr?.message);
+    }
+  }
+
+  // 2. Transactional Application Fallback (Used if RPC is not yet registered in environment)
+  const lockKey = `${dbDepositId}_${input.rewardLevel}`;
+  if (ongoingProcessingLocks.has(lockKey)) {
+    const existing = await getReferralRewardByDepositAndLevel(dbDepositId, input.rewardLevel);
+    return {
+      success: true,
+      isDuplicate: true,
+      reward: existing || undefined,
+      ledgerCreatedInDb: true,
+      message: `Referral reward for deposit #${dbDepositId} at level ${input.rewardLevel} is currently processing or already credited.`,
+    };
+  }
+  ongoingProcessingLocks.add(lockKey);
+
+  try {
+    const existingReward = await getReferralRewardByDepositAndLevel(dbDepositId, input.rewardLevel);
+    if (existingReward) {
+      return {
+        success: true,
+        isDuplicate: true,
+        reward: existingReward,
+        ledgerCreatedInDb: true,
+        message: `Referral reward for deposit #${dbDepositId} at level ${input.rewardLevel} already exists.`,
+      };
+    }
+
+    try {
+      const createdReward = await createReferralReward({
+        referralId: dbReferralId ? String(dbReferralId) : undefined,
+        referrerId: String(dbReferrerId),
+        referredId: String(dbReferredId),
+        depositId: String(dbDepositId),
+        amount: input.amount,
+        percentage: input.percentage,
+        reference: input.reference,
+        status: 'credited',
+        rewardLevel: input.rewardLevel,
+        notes: input.notes,
+      });
+
+      return {
+        success: true,
+        isDuplicate: false,
+        reward: createdReward,
+        ledgerCreatedInDb: false,
+      };
+    } catch (createErr: any) {
+      if (
+        createErr instanceof DuplicateReferralRewardError ||
+        createErr.name === 'DuplicateReferralRewardError' ||
+        createErr.message?.includes('duplicate') ||
+        createErr.message?.includes('unique')
+      ) {
+        const existing = await getReferralRewardByDepositAndLevel(dbDepositId, input.rewardLevel);
+        return {
+          success: true,
+          isDuplicate: true,
+          reward: existing || undefined,
+          ledgerCreatedInDb: true,
+          message: `Referral reward for deposit #${dbDepositId} at level ${input.rewardLevel} already exists.`,
+        };
+      }
+      return {
+        success: false,
+        error: createErr?.message || 'Failed to credit referral reward.',
+      };
+    }
+  } finally {
+    ongoingProcessingLocks.delete(lockKey);
+  }
+}
+

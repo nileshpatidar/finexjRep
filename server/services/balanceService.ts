@@ -2,6 +2,8 @@ import { getProfileById } from '../repositories/profiles';
 import { getDepositsByUserId } from '../repositories/deposits';
 import { getEarningsByUserId } from '../repositories/earnings';
 import { getWithdrawalsByUserId } from '../repositories/withdrawals';
+import { getReferralRewardsByReferrerId } from '../repositories/referrals';
+import { getLedgerByUserId } from '../repositories/ledger';
 import { getSettings } from '../repositories/settings';
 import { createLedgerEntry } from '../repositories/ledger';
 import { createAuditLog } from '../repositories/auditLogs';
@@ -16,10 +18,12 @@ export async function calculateUserBalanceAsync(userId: string): Promise<UserBal
   }
 
   const settings = await getSettings();
-  const [deposits, earnings, withdrawals] = await Promise.all([
+  const [deposits, earnings, withdrawals, referralRewards, ledgerEntries] = await Promise.all([
     getDepositsByUserId(userId),
     getEarningsByUserId(userId),
     getWithdrawalsByUserId(userId),
+    getReferralRewardsByReferrerId(userId),
+    getLedgerByUserId(userId),
   ]);
 
   const now = new Date();
@@ -32,7 +36,16 @@ export async function calculateUserBalanceAsync(userId: string): Promise<UserBal
   const creditedEarnings = earnings.filter(e => e.status === 'credited');
   const totalEarnings = creditedEarnings.reduce((acc, e) => acc + e.earningsAmount, 0);
 
-  // 3. Withdrawals
+  // 3. Referral Rewards (Tracked separately, NOT merged into compounding principal)
+  const creditedReferrals = referralRewards.filter(r => r.status === 'credited');
+  const referralEarnings = creditedReferrals.reduce((acc, r) => acc + r.amount, 0);
+
+  // 4. Admin adjustments from ledger
+  const adminAdjustments = ledgerEntries
+    .filter(l => l.type === 'admin_adjustment')
+    .reduce((acc, l) => acc + l.amount, 0);
+
+  // 5. Withdrawals
   const paidWithdrawals = withdrawals.filter(w => w.status === 'paid');
   const totalWithdrawn = paidWithdrawals.reduce((acc, w) => acc + w.requestedAmount, 0);
   const totalFeesPaid = paidWithdrawals.reduce((acc, w) => acc + w.feeAmount, 0);
@@ -42,25 +55,32 @@ export async function calculateUserBalanceAsync(userId: string): Promise<UserBal
   );
   const totalPendingWithdrawals = activePendingWithdrawals.reduce((acc, w) => acc + w.requestedAmount, 0);
 
-  // Available balance
-  const rawBalance = totalDeposited + totalEarnings - totalWithdrawn - totalPendingWithdrawals;
+  // Available balance: sum of all inflows minus outflows
+  const rawBalance = totalDeposited + totalEarnings + referralEarnings + adminAdjustments - totalWithdrawn - totalPendingWithdrawals;
   const availableBalance = Math.max(0, Number(rawBalance.toFixed(4)));
 
-  // 4. Deposit Principal Lock
-  const depositLockMs = (settings.depositLockPeriodDays || 30) * 24 * 60 * 60 * 1000;
+  // Active Compounding Principal: ONLY deposit principal minus withdrawals. Referral income never compounds.
+  const activeCompoundingPrincipal = Math.max(0, Number((totalDeposited - totalWithdrawn).toFixed(4)));
+
+  // 6. Deposit Principal Lock (Per-deposit independent 30-day lock from confirmed deposit date)
+  const lockDays = typeof settings.depositLockPeriodDays === 'number' && !isNaN(settings.depositLockPeriodDays)
+    ? settings.depositLockPeriodDays
+    : 30;
+  const depositLockMs = lockDays * 24 * 60 * 60 * 1000;
   let depositLockedAmount = 0;
 
   for (const dep of confirmedDeposits) {
-    if (dep.confirmedAt) {
-      const confirmedDate = new Date(dep.confirmedAt).getTime();
-      const lockExpiry = confirmedDate + depositLockMs;
-      if (now.getTime() < lockExpiry) {
-        depositLockedAmount += dep.amount;
-      }
+    const depositDate = dep.confirmedAt ? new Date(dep.confirmedAt).getTime() : new Date(dep.createdAt).getTime();
+    const lockExpiry = dep.depositLockEndDate ? new Date(dep.depositLockEndDate).getTime() : (depositDate + depositLockMs);
+    if (now.getTime() < lockExpiry) {
+      depositLockedAmount += dep.amount;
     }
   }
 
-  // 5. Check user-level 30-Day Fund Lock
+  // Active locked principal cannot exceed remaining active compounding principal
+  const depositLockedPrincipal = Math.max(0, Math.min(activeCompoundingPrincipal, depositLockedAmount));
+
+  // 7. Check user-level 30-Day Fund Lock
   let isFundLocked = false;
   let fundLockRemainingDays = 0;
   let fundLockRemainingHours = 0;
@@ -77,15 +97,18 @@ export async function calculateUserBalanceAsync(userId: string): Promise<UserBal
     }
   }
 
-  // 6. Check 30-day account age rule
+  // 8. Check 30-day account age rule (Separate business rule from per-deposit locks)
   const createdAtTime = new Date(user.createdAt).getTime();
   const accountAgeMs = now.getTime() - createdAtTime;
-  const requiredAgeMs = (settings.accountAgeRequirementDays || 30) * 24 * 60 * 60 * 1000;
+  const ageDays = typeof settings.accountAgeRequirementDays === 'number' && !isNaN(settings.accountAgeRequirementDays)
+    ? settings.accountAgeRequirementDays
+    : 30;
+  const requiredAgeMs = ageDays * 24 * 60 * 60 * 1000;
   const is30DaysOld = accountAgeMs >= requiredAgeMs;
   const accountAgeDays = Number((accountAgeMs / (24 * 60 * 60 * 1000)).toFixed(2));
   const withdrawalEligibleDate = new Date(createdAtTime + requiredAgeMs).toISOString();
 
-  let lockedBalance = depositLockedAmount;
+  let lockedBalance = depositLockedPrincipal;
   let eligibleForWithdrawal = 0;
   let canWithdraw = true;
   let withdrawalRestrictionReason: string | undefined = undefined;
@@ -93,26 +116,35 @@ export async function calculateUserBalanceAsync(userId: string): Promise<UserBal
   if (user.status !== 'active') {
     canWithdraw = false;
     withdrawalRestrictionReason = `Account is currently ${user.status}.`;
-  } else if (!is30DaysOld) {
-    canWithdraw = false;
-    const remainingMs = Math.max(0, requiredAgeMs - accountAgeMs);
-    const remDays = Math.floor(remainingMs / (24 * 60 * 60 * 1000));
-    const remHours = Math.floor((remainingMs % (24 * 60 * 60 * 1000)) / (60 * 60 * 1000));
-    withdrawalRestrictionReason = `Account must complete 30 full days before withdrawal. Remaining: ${remDays}d ${remHours}h.`;
-  } else if (isFundLocked) {
-    canWithdraw = false;
-    lockedBalance = availableBalance;
-    eligibleForWithdrawal = 0;
-    withdrawalRestrictionReason = `30-Day Fund Lock active after withdrawal. Unlocks on ${new Date(user.fundLockUntil!).toLocaleDateString()} (${fundLockRemainingDays}d ${fundLockRemainingHours}h remaining).`;
   } else if (availableBalance <= 0) {
     canWithdraw = false;
     withdrawalRestrictionReason = 'Insufficient available balance.';
-  } else {
-    // Eligible amount is available balance minus locked principal
-    eligibleForWithdrawal = Math.max(0, Number((availableBalance - depositLockedAmount).toFixed(4)));
-    if (eligibleForWithdrawal <= 0 && depositLockedAmount > 0) {
+  } else if (!is30DaysOld) {
+    // Account maturity rule: account must reach 30 days before principal/earnings unlock. Referral earnings can always be withdrawn.
+    lockedBalance = Math.min(availableBalance, Math.max(depositLockedPrincipal, availableBalance - referralEarnings));
+    eligibleForWithdrawal = Math.max(0, Number((availableBalance - lockedBalance).toFixed(4)));
+    if (eligibleForWithdrawal <= 0) {
       canWithdraw = false;
-      withdrawalRestrictionReason = 'Principal deposit is in mandatory 30-day lock period.';
+      const remainingMs = Math.max(0, requiredAgeMs - accountAgeMs);
+      const remDays = Math.floor(remainingMs / (24 * 60 * 60 * 1000));
+      const remHours = Math.floor((remainingMs % (24 * 60 * 60 * 1000)) / (60 * 60 * 1000));
+      withdrawalRestrictionReason = `Account must complete ${ageDays} full days before principal withdrawal. Remaining: ${remDays}d ${remHours}h.`;
+    }
+  } else if (isFundLocked) {
+    // Voluntary fund lock active: non-referral balance locked
+    lockedBalance = Math.max(0, availableBalance - referralEarnings);
+    eligibleForWithdrawal = Math.max(0, Number((availableBalance - lockedBalance).toFixed(4)));
+    if (eligibleForWithdrawal <= 0) {
+      canWithdraw = false;
+      withdrawalRestrictionReason = `30-Day Fund Lock active. Unlocks on ${new Date(user.fundLockUntil!).toLocaleDateString()} (${fundLockRemainingDays}d ${fundLockRemainingHours}h remaining).`;
+    }
+  } else {
+    // Mature account: per-deposit locking rule (30 days from each deposit date)
+    lockedBalance = Math.min(availableBalance, depositLockedPrincipal);
+    eligibleForWithdrawal = Math.max(0, Number((availableBalance - lockedBalance).toFixed(4)));
+    if (eligibleForWithdrawal <= 0) {
+      canWithdraw = false;
+      withdrawalRestrictionReason = 'Your deposited funds are currently locked. Withdrawals are available only after the applicable deposit lock period has ended.';
     }
   }
 
@@ -120,6 +152,9 @@ export async function calculateUserBalanceAsync(userId: string): Promise<UserBal
     userId: user.id,
     totalDeposited: Number(totalDeposited.toFixed(2)),
     totalEarnings: Number(totalEarnings.toFixed(4)),
+    referralEarnings: Number(referralEarnings.toFixed(4)),
+    activeCompoundingPrincipal,
+    depositLockedPrincipal: Number(depositLockedPrincipal.toFixed(2)),
     totalWithdrawn: Number(totalWithdrawn.toFixed(2)),
     totalFeesPaid: Number(totalFeesPaid.toFixed(2)),
     totalPendingWithdrawals: Number(totalPendingWithdrawals.toFixed(2)),
@@ -136,6 +171,269 @@ export async function calculateUserBalanceAsync(userId: string): Promise<UserBal
     fundLockRemainingDays,
     fundLockRemainingHours,
     fundLockReason,
+  };
+}
+
+export interface WithdrawalImpactResult {
+  canWithdraw: boolean;
+  error?: string;
+  availableBalance: number;
+  referralEarnings: number;
+  activeCompoundingPrincipal: number;
+  depositLockedPrincipal: number;
+  isFundLocked: boolean;
+  is30DaysOld: boolean;
+  requestedAmount: number;
+  feePercentage: number;
+  feeAmount: number;
+  netAmount: number;
+  isReferralOnly: boolean;
+  touchesProtectedFund: boolean;
+  requiresCompoundingNotice?: boolean;
+  compoundingNoticeTitle?: string;
+  compoundingNoticeText?: string;
+  requiresLockBreakConfirmation: boolean;
+  lockBreakWarning?: string;
+  requiresMinimumBreakConfirmation: boolean;
+  minimumBreakWarning?: string;
+  projectedRemainingPrincipal: number;
+  minimumDepositAmount?: number;
+}
+
+/**
+ * Accurately determines the source of funds and financial warnings for a requested withdrawal.
+ * Distinguishes between referral earnings (free to withdraw) and compounding principal/earnings (30-day lock & $300 minimum).
+ */
+export async function checkWithdrawalImpactAsync(
+  userId: string,
+  requestedAmount: number
+): Promise<WithdrawalImpactResult> {
+  let balance: UserBalanceSummary;
+  try {
+    balance = await calculateUserBalanceAsync(userId);
+  } catch (err: any) {
+    return {
+      canWithdraw: false,
+      error: err?.message || 'User not found',
+      availableBalance: 0,
+      referralEarnings: 0,
+      activeCompoundingPrincipal: 0,
+      depositLockedPrincipal: 0,
+      isFundLocked: false,
+      is30DaysOld: false,
+      requestedAmount,
+      feePercentage: 9,
+      feeAmount: 0,
+      netAmount: 0,
+      isReferralOnly: false,
+      touchesProtectedFund: false,
+      requiresLockBreakConfirmation: false,
+      requiresMinimumBreakConfirmation: false,
+      projectedRemainingPrincipal: 0,
+    };
+  }
+  let settings: any;
+  try {
+    settings = await getSettings();
+  } catch (err: any) {
+    return {
+      canWithdraw: false,
+      error: 'Financial configuration is temporarily unavailable. Please try again later.',
+      availableBalance: balance.availableBalance,
+      referralEarnings: balance.referralEarnings,
+      activeCompoundingPrincipal: balance.activeCompoundingPrincipal,
+      depositLockedPrincipal: balance.depositLockedPrincipal,
+      isFundLocked: balance.isFundLocked,
+      is30DaysOld: balance.is30DaysOld,
+      requestedAmount,
+      feePercentage: 0,
+      feeAmount: 0,
+      netAmount: 0,
+      isReferralOnly: false,
+      touchesProtectedFund: false,
+      requiresLockBreakConfirmation: false,
+      requiresMinimumBreakConfirmation: false,
+      projectedRemainingPrincipal: balance.activeCompoundingPrincipal,
+    };
+  }
+
+  // STRICT CONFIGURATION SAFETY: Fail safely if financial settings are missing or invalid
+  const rawFee = Number(settings.withdrawalFeePercentage);
+  if (isNaN(rawFee) || rawFee < 0 || rawFee >= 100) {
+    return {
+      canWithdraw: false,
+      error: 'Financial configuration error: withdrawalFeePercentage is invalid or missing in system settings.',
+      availableBalance: balance.availableBalance,
+      referralEarnings: balance.referralEarnings,
+      activeCompoundingPrincipal: balance.activeCompoundingPrincipal,
+      depositLockedPrincipal: balance.depositLockedPrincipal,
+      isFundLocked: balance.isFundLocked,
+      is30DaysOld: balance.is30DaysOld,
+      requestedAmount,
+      feePercentage: 0,
+      feeAmount: 0,
+      netAmount: 0,
+      isReferralOnly: false,
+      touchesProtectedFund: false,
+      requiresLockBreakConfirmation: false,
+      requiresMinimumBreakConfirmation: false,
+      projectedRemainingPrincipal: balance.activeCompoundingPrincipal,
+    };
+  }
+
+  const rawMin = Number(settings.minimumDepositAmount);
+  if (isNaN(rawMin) || rawMin <= 0) {
+    return {
+      canWithdraw: false,
+      error: 'Financial configuration error: minimumDepositAmount is invalid or missing in system settings.',
+      availableBalance: balance.availableBalance,
+      referralEarnings: balance.referralEarnings,
+      activeCompoundingPrincipal: balance.activeCompoundingPrincipal,
+      depositLockedPrincipal: balance.depositLockedPrincipal,
+      isFundLocked: balance.isFundLocked,
+      is30DaysOld: balance.is30DaysOld,
+      requestedAmount,
+      feePercentage: rawFee,
+      feeAmount: 0,
+      netAmount: 0,
+      isReferralOnly: false,
+      touchesProtectedFund: false,
+      requiresLockBreakConfirmation: false,
+      requiresMinimumBreakConfirmation: false,
+      projectedRemainingPrincipal: balance.activeCompoundingPrincipal,
+    };
+  }
+
+  const feePercentage = rawFee;
+  const minDeposit = rawMin;
+
+  if (requestedAmount <= 0) {
+    return {
+      canWithdraw: false,
+      error: 'Withdrawal amount must be greater than zero.',
+      availableBalance: balance.availableBalance,
+      referralEarnings: balance.referralEarnings,
+      activeCompoundingPrincipal: balance.activeCompoundingPrincipal,
+      depositLockedPrincipal: balance.depositLockedPrincipal,
+      isFundLocked: balance.isFundLocked,
+      is30DaysOld: balance.is30DaysOld,
+      requestedAmount,
+      feePercentage,
+      feeAmount: 0,
+      netAmount: 0,
+      isReferralOnly: false,
+      touchesProtectedFund: false,
+      requiresLockBreakConfirmation: false,
+      requiresMinimumBreakConfirmation: false,
+      projectedRemainingPrincipal: balance.activeCompoundingPrincipal,
+    };
+  }
+
+  if (requestedAmount > balance.availableBalance) {
+    return {
+      canWithdraw: false,
+      error: `Requested amount ($${requestedAmount.toFixed(2)}) exceeds your available balance ($${balance.availableBalance.toFixed(2)}).`,
+      availableBalance: balance.availableBalance,
+      referralEarnings: balance.referralEarnings,
+      activeCompoundingPrincipal: balance.activeCompoundingPrincipal,
+      depositLockedPrincipal: balance.depositLockedPrincipal,
+      isFundLocked: balance.isFundLocked,
+      is30DaysOld: balance.is30DaysOld,
+      requestedAmount,
+      feePercentage,
+      feeAmount: 0,
+      netAmount: 0,
+      isReferralOnly: false,
+      touchesProtectedFund: false,
+      requiresLockBreakConfirmation: false,
+      requiresMinimumBreakConfirmation: false,
+      projectedRemainingPrincipal: balance.activeCompoundingPrincipal,
+    };
+  }
+
+  if (requestedAmount > balance.eligibleForWithdrawal) {
+    let lockError = 'Your deposited funds are currently locked. Withdrawals are available only after the applicable deposit lock period has ended.';
+    if (!balance.is30DaysOld && requestedAmount > balance.referralEarnings) {
+      lockError = balance.withdrawalRestrictionReason || 'Account must complete 30 full days before principal withdrawal.';
+    } else if (balance.isFundLocked && requestedAmount > balance.referralEarnings) {
+      lockError = balance.withdrawalRestrictionReason || 'Your funds are currently locked under an active 30-day fund lock.';
+    }
+    return {
+      canWithdraw: false,
+      error: lockError,
+      availableBalance: balance.availableBalance,
+      referralEarnings: balance.referralEarnings,
+      activeCompoundingPrincipal: balance.activeCompoundingPrincipal,
+      depositLockedPrincipal: balance.depositLockedPrincipal,
+      isFundLocked: balance.isFundLocked,
+      is30DaysOld: balance.is30DaysOld,
+      requestedAmount,
+      feePercentage,
+      feeAmount: 0,
+      netAmount: 0,
+      isReferralOnly: false,
+      touchesProtectedFund: false,
+      requiresLockBreakConfirmation: false,
+      requiresMinimumBreakConfirmation: false,
+      projectedRemainingPrincipal: balance.activeCompoundingPrincipal,
+    };
+  }
+
+  const feeAmount = Number((requestedAmount * (feePercentage / 100.0)).toFixed(4));
+  const netAmount = Number((requestedAmount - feeAmount).toFixed(4));
+
+  // Determine if withdrawal is funded strictly by referral earnings
+  const isReferralOnly = requestedAmount <= balance.referralEarnings;
+  let touchesProtectedFund = false;
+  let requiresCompoundingNotice = false;
+  let compoundingNoticeTitle: string | undefined = undefined;
+  let compoundingNoticeText: string | undefined = undefined;
+  let requiresMinimumBreakConfirmation = false;
+  let minimumBreakWarning: string | undefined = undefined;
+
+  let amountFromProtected = 0;
+  if (!isReferralOnly) {
+    touchesProtectedFund = true;
+    amountFromProtected = requestedAmount - balance.referralEarnings;
+    requiresCompoundingNotice = true;
+    compoundingNoticeTitle = 'Withdrawal Notice';
+    compoundingNoticeText =
+      'Your requested withdrawal will reduce your active compounding principal. If you withdraw funds, the withdrawn amount will no longer participate in future compounding/earning calculations according to the platform rules. Your current compounding/earning cycle may be reduced or stopped depending on the amount withdrawn.';
+  }
+
+  const projectedRemainingPrincipal = Math.max(0, Number((balance.activeCompoundingPrincipal - amountFromProtected).toFixed(4)));
+
+  if (touchesProtectedFund) {
+    // Check if remaining principal falls below the configured minimum required for compounding/earnings
+    if (projectedRemainingPrincipal < minDeposit && balance.activeCompoundingPrincipal >= minDeposit) {
+      requiresMinimumBreakConfirmation = true;
+      minimumBreakWarning = `Your withdrawal will reduce your eligible fund below the minimum required amount ($${minDeposit} USDT). If you continue, daily compounding earnings and Refer & Earn eligibility will become inactive.`;
+    }
+  }
+
+  return {
+    canWithdraw: true,
+    availableBalance: balance.availableBalance,
+    referralEarnings: balance.referralEarnings,
+    activeCompoundingPrincipal: balance.activeCompoundingPrincipal,
+    depositLockedPrincipal: balance.depositLockedPrincipal,
+    isFundLocked: balance.isFundLocked,
+    is30DaysOld: balance.is30DaysOld,
+    requestedAmount,
+    feePercentage,
+    feeAmount,
+    netAmount,
+    isReferralOnly,
+    touchesProtectedFund,
+    requiresCompoundingNotice,
+    compoundingNoticeTitle,
+    compoundingNoticeText,
+    requiresLockBreakConfirmation: false,
+    lockBreakWarning: compoundingNoticeText,
+    requiresMinimumBreakConfirmation,
+    minimumBreakWarning,
+    projectedRemainingPrincipal,
+    minimumDepositAmount: minDeposit,
   };
 }
 

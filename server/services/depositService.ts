@@ -10,8 +10,10 @@ import { createLedgerEntry } from '../repositories/ledger';
 import { createAuditLog } from '../repositories/auditLogs';
 import { getSettings } from '../repositories/settings';
 import { uploadDepositProof } from '../storage';
-import { verifyBEP20Deposit, isValidTxHash } from '../blockchain';
+import { verifyBEP20Deposit, isValidTxHash, isValidBEP20Address, VerificationResult } from '../blockchain';
 import { calculateUserBalanceAsync } from './balanceService';
+import { checkWalletDuplication } from './fraudService';
+import { processReferralRewardForDepositAsync } from './referralService';
 import { Deposit } from '../types';
 
 export interface ProcessDepositInput {
@@ -30,15 +32,6 @@ export async function processDepositAsync(input: ProcessDepositInput): Promise<{
   message?: string;
   error?: string;
 }> {
-  const user = await getProfileById(input.userId);
-  if (!user) {
-    return { success: false, error: 'User not found.' };
-  }
-
-  if (user.status !== 'active') {
-    return { success: false, error: 'Account is not active.' };
-  }
-
   const rawTxHash = input.txHash ? input.txHash.trim().toLowerCase() : '';
   if (!rawTxHash) {
     return { success: false, error: 'BNB Smart Chain Transaction Hash (TxID) is required.' };
@@ -49,6 +42,71 @@ export async function processDepositAsync(input: ProcessDepositInput): Promise<{
       success: false,
       error: 'Invalid transaction hash format. Must be a 66-character BEP-20 hex string starting with 0x.',
     };
+  }
+
+  let settings: any;
+  try {
+    settings = await getSettings();
+  } catch (err: any) {
+    return {
+      success: false,
+      error: 'Financial configuration is temporarily unavailable. Please try again later.',
+    };
+  }
+
+  const minDeposit = Number(settings.minimumDepositAmount);
+  if (isNaN(minDeposit) || minDeposit <= 0) {
+    return {
+      success: false,
+      error: 'Financial configuration error: minimumDepositAmount is invalid or missing in system settings.',
+    };
+  }
+
+  const reqConfirmations = Number(settings.requiredConfirmations);
+  if (isNaN(reqConfirmations) || reqConfirmations < 1) {
+    return {
+      success: false,
+      error: 'Financial configuration error: requiredConfirmations is invalid or missing in system settings.',
+    };
+  }
+
+  if (!settings.bep20DepositAddress || !isValidBEP20Address(settings.bep20DepositAddress)) {
+    return {
+      success: false,
+      error: 'Financial configuration error: bep20DepositAddress is invalid or missing in system settings.',
+    };
+  }
+
+  if (!settings.usdtContractAddress || !isValidBEP20Address(settings.usdtContractAddress)) {
+    return {
+      success: false,
+      error: 'Financial configuration error: usdtContractAddress is invalid or missing in system settings.',
+    };
+  }
+  const claimedAmount = input.amount !== undefined && !isNaN(Number(input.amount)) ? Number(input.amount) : undefined;
+
+  if (claimedAmount !== undefined) {
+    if (claimedAmount <= 0) {
+      return {
+        success: false,
+        error: 'Deposit amount must be greater than zero.',
+      };
+    }
+    if (claimedAmount < minDeposit) {
+      return {
+        success: false,
+        error: `Deposit amount ($${claimedAmount.toFixed(2)} USDT) is below the minimum deposit requirement of $${minDeposit.toFixed(2)} USDT.`,
+      };
+    }
+  }
+
+  const user = await getProfileById(input.userId);
+  if (!user) {
+    return { success: false, error: 'User not found.' };
+  }
+
+  if (user.status !== 'active') {
+    return { success: false, error: 'Account is not active.' };
   }
 
   // 1. Cross-Table Anti-Replay & Uniqueness Protection
@@ -76,7 +134,7 @@ export async function processDepositAsync(input: ProcessDepositInput): Promise<{
   // Cross-check withdrawals table: ensure payout hash is not reused as deposit hash
   try {
     const { getAllWithdrawals } = await import('../repositories/withdrawals');
-    const { withdrawals: allWds } = await getAllWithdrawals({ limit: 1000 });
+    const { withdrawals: allWds } = await getAllWithdrawals();
     const collidingWithdrawal = allWds.find(
       w => w.txHash?.toLowerCase() === rawTxHash || (w as any).payoutTxHash?.toLowerCase() === rawTxHash
     );
@@ -90,25 +148,41 @@ export async function processDepositAsync(input: ProcessDepositInput): Promise<{
     // proceed
   }
 
-  const settings = await getSettings();
-  const minDeposit = Number(settings.minimumDepositAmount || 300);
-  const claimedAmount = input.amount && !isNaN(Number(input.amount)) ? Number(input.amount) : undefined;
+  const isTestUser = process.env.NODE_ENV !== 'production' && user.isTestUser === true;
 
-  // 2. Authoritative Blockchain Verification against Real BSC RPC
-  const verification = await verifyBEP20Deposit(rawTxHash, claimedAmount);
+  let verification: VerificationResult;
 
-  // If the transaction is definitively invalid on-chain (wrong token, wrong recipient, reverted)
-  if (verification.status === 'failed') {
-    return {
-      success: false,
-      error: verification.errorMessage || 'Transaction execution failed (reverted on BNB Smart Chain).',
-    };
-  }
+  if (!isTestUser) {
+    // 2. Authoritative Blockchain Verification against Real BSC RPC
+    verification = await verifyBEP20Deposit(rawTxHash, claimedAmount);
 
-  if (verification.status === 'invalid') {
-    return {
-      success: false,
-      error: verification.errorMessage || 'Transaction does not meet BEP-20 USDT deposit rules.',
+    // If the transaction is definitively invalid on-chain (wrong token, wrong recipient, reverted)
+    if (verification.status === 'failed') {
+      return {
+        success: false,
+        error: verification.errorMessage || 'Transaction execution failed (reverted on BNB Smart Chain).',
+      };
+    }
+
+    if (verification.status === 'invalid') {
+      return {
+        success: false,
+        error: verification.errorMessage || 'Transaction does not meet BEP-20 USDT deposit rules.',
+      };
+    }
+  } else {
+    // Non-Production Testing Bypass ONLY: Strictly prohibited in production
+    const reqConf = Number(settings.requiredConfirmations);
+    verification = {
+      isValid: true,
+      amount: claimedAmount || minDeposit,
+      txHash: rawTxHash,
+      toAddress: settings.bep20DepositAddress,
+      tokenContract: settings.usdtContractAddress,
+      confirmations: reqConf,
+      requiredConfirmations: reqConf,
+      isPendingConfirmations: false,
+      status: 'confirmed',
     };
   }
 
@@ -144,6 +218,10 @@ export async function processDepositAsync(input: ProcessDepositInput): Promise<{
   }
 
   // 3. Persist Verified Deposit Record
+  if (verification.fromAddress) {
+    checkWalletDuplication(verification.fromAddress, user.id, 'deposit').catch(() => {});
+  }
+
   const newDeposit = await createDeposit({
     userId: user.id,
     amount: authoritativeAmount,
@@ -155,12 +233,12 @@ export async function processDepositAsync(input: ProcessDepositInput): Promise<{
     toAddress: verification.toAddress || settings.bep20DepositAddress,
     tokenContract: verification.tokenContract || settings.usdtContractAddress,
     blockNumber: verification.blockNumber,
-    status: isConfirmed ? 'confirmed' : 'pending',
+    status: 'pending',
     confirmations: verification.confirmations || 0,
-    requiredConfirmations: verification.requiredConfirmations || settings.requiredConfirmations || 12,
+    requiredConfirmations: verification.requiredConfirmations || Number(settings.requiredConfirmations),
     createdAt: now.toISOString(),
-    confirmedAt: isConfirmed ? now.toISOString() : undefined,
-    verifiedAt: verification.blockNumber ? now.toISOString() : undefined,
+    confirmedAt: undefined,
+    verifiedAt: verification.blockNumber || isTestUser ? now.toISOString() : undefined,
     eligibilityDate: tomorrow.toISOString(),
     depositLockEndDate: lockEndDate,
     proofPhotoUrl: storagePath,
@@ -176,31 +254,60 @@ export async function processDepositAsync(input: ProcessDepositInput): Promise<{
 
   // 4. Atomic Financial Credit (Only when verified with >= required confirmations)
   if (isConfirmed) {
-    const balance = await calculateUserBalanceAsync(user.id);
-    await createLedgerEntry({
-      userId: user.id,
-      type: 'deposit',
-      amount: authoritativeAmount,
-      balanceAfter: balance.availableBalance,
-      referenceId: newDeposit.id,
-      description: `Confirmed BEP-20 USDT deposit of ${authoritativeAmount} USDT (Tx: ${rawTxHash})`,
-      createdAt: now.toISOString(),
-      performedBy: 'blockchain_verifier',
+    const confirmResult = await confirmDepositAtomic({
+      depositId: newDeposit.id,
+      adminId: 'blockchain_verifier',
+      adminNotes: `Automated on-chain verification confirmed ${authoritativeAmount} USDT with ${verification.confirmations ?? 0} BSC confirmations.`,
+      txHash: rawTxHash,
+      fromAddress: verification.fromAddress,
+      blockNumber: verification.blockNumber,
+      tokenContract: verification.tokenContract,
+      confirmations: verification.confirmations,
+      actualAmount: authoritativeAmount,
     });
 
-    await createAuditLog({
-      action: 'DEPOSIT_CONFIRMED',
-      actorId: user.id,
-      actorEmail: user.email,
-      actorRole: user.role,
-      targetUserId: user.id,
-      reason: `Automated on-chain verification confirmed ${authoritativeAmount} USDT with ${verification.confirmations} confirmations.`,
-      timestamp: now.toISOString(),
-    });
+    if (!confirmResult.success || !confirmResult.deposit) {
+      return { success: false, error: confirmResult.error || 'Failed to confirm deposit atomically.' };
+    }
+
+    if (!confirmResult.ledgerCreatedInDb) {
+      const balance = await calculateUserBalanceAsync(user.id);
+      await createLedgerEntry({
+        userId: user.id,
+        type: 'deposit',
+        amount: authoritativeAmount,
+        balanceAfter: balance.availableBalance,
+        referenceId: newDeposit.id,
+        description: `Confirmed BEP-20 USDT deposit of ${authoritativeAmount} USDT (Tx: ${rawTxHash})`,
+        createdAt: now.toISOString(),
+        performedBy: 'blockchain_verifier',
+      });
+
+      await createAuditLog({
+        action: 'DEPOSIT_CONFIRMED',
+        actorId: user.id,
+        actorEmail: user.email,
+        actorRole: user.role,
+        targetUserId: user.id,
+        reason: `Automated on-chain verification confirmed ${authoritativeAmount} USDT with ${verification.confirmations ?? 0} confirmations.`,
+        timestamp: now.toISOString(),
+      });
+    }
+
+    // Authoritative Referral Reward Processing:
+    // When deposit is confirmed, credit referral rewards (5% Level 1, 2% Level 2).
+    // Test user deposits NEVER generate referral rewards under any circumstances.
+    if (!isTestUser && (!confirmResult.rewardsCreated || (Array.isArray(confirmResult.rewardsCreated) && confirmResult.rewardsCreated.length === 0))) {
+      try {
+        await processReferralRewardForDepositAsync(newDeposit.id, authoritativeAmount, user.id);
+      } catch (refErr: any) {
+        console.warn(`[Referral Reward Warning] Failed to process referral reward for deposit #${newDeposit.id}:`, refErr?.message || refErr);
+      }
+    }
 
     return {
       success: true,
-      deposit: newDeposit,
+      deposit: confirmResult.deposit,
       message: `Deposit of $${authoritativeAmount.toFixed(2)} USDT successfully verified on BNB Smart Chain and credited!`,
     };
   }
@@ -254,16 +361,45 @@ export async function verifyDepositOnChainAsync(
     };
   }
 
-  const verification = await verifyBEP20Deposit(deposit.txHash, deposit.amount);
+  const depositUser = await getProfileById(deposit.userId);
+  const isTestUser = process.env.NODE_ENV !== 'production' && depositUser?.isTestUser === true;
 
-  if (verification.status === 'failed' || verification.status === 'invalid') {
-    await updateDeposit(deposit.id, {
-      status: 'rejected',
-      adminNotes: verification.errorMessage,
-    });
-    return {
-      success: false,
-      error: verification.errorMessage || 'Transaction verification failed on BNB Smart Chain.',
+  let verification: VerificationResult;
+
+  if (!isTestUser) {
+    verification = await verifyBEP20Deposit(deposit.txHash, deposit.amount);
+
+    if (verification.status === 'failed' || verification.status === 'invalid') {
+      await updateDeposit(deposit.id, {
+        status: 'rejected',
+        adminNotes: verification.errorMessage,
+      });
+      return {
+        success: false,
+        error: verification.errorMessage || 'Transaction verification failed on BNB Smart Chain.',
+      };
+    }
+  } else {
+    let settings: any;
+    try {
+      settings = await getSettings();
+    } catch (err: any) {
+      return {
+        success: false,
+        error: 'Financial configuration is temporarily unavailable. Please try again later.',
+      };
+    }
+    const reqConf = Number(deposit.requiredConfirmations || settings.requiredConfirmations);
+    verification = {
+      isValid: true,
+      amount: deposit.amount,
+      txHash: deposit.txHash,
+      toAddress: deposit.toAddress || settings.bep20DepositAddress,
+      tokenContract: deposit.tokenContract || settings.usdtContractAddress,
+      confirmations: reqConf,
+      requiredConfirmations: reqConf,
+      isPendingConfirmations: false,
+      status: 'confirmed',
     };
   }
 
@@ -287,26 +423,37 @@ export async function verifyDepositOnChainAsync(
       return { success: false, error: confirmResult.error || 'Failed to confirm deposit atomically.' };
     }
 
-    const balance = await calculateUserBalanceAsync(deposit.userId);
-    await createLedgerEntry({
-      userId: deposit.userId,
-      type: 'deposit',
-      amount: verifiedAmount,
-      balanceAfter: balance.availableBalance,
-      referenceId: deposit.id,
-      description: `Confirmed BEP-20 USDT deposit of ${verifiedAmount} USDT (Tx: ${deposit.txHash})`,
-      createdAt: new Date().toISOString(),
-      performedBy: actorId,
-    });
+    if (!confirmResult.ledgerCreatedInDb) {
+      const balance = await calculateUserBalanceAsync(deposit.userId);
+      await createLedgerEntry({
+        userId: deposit.userId,
+        type: 'deposit',
+        amount: verifiedAmount,
+        balanceAfter: balance.availableBalance,
+        referenceId: deposit.id,
+        description: `Confirmed BEP-20 USDT deposit of ${verifiedAmount} USDT (Tx: ${deposit.txHash})`,
+        createdAt: new Date().toISOString(),
+        performedBy: actorId,
+      });
 
-    await createAuditLog({
-      action: 'DEPOSIT_CONFIRMED',
-      actorId,
-      actorRole: 'system',
-      targetUserId: deposit.userId,
-      reason: `Re-verification confirmed ${verifiedAmount} USDT on BSC with ${verification.confirmations} confirmations.`,
-      timestamp: new Date().toISOString(),
-    });
+      await createAuditLog({
+        action: 'DEPOSIT_CONFIRMED',
+        actorId,
+        actorRole: 'system',
+        targetUserId: deposit.userId,
+        reason: `Re-verification confirmed ${verifiedAmount} USDT on BSC with ${verification.confirmations} confirmations.`,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // Authoritative Referral Reward Processing (blocked for test accounts)
+    if (!isTestUser && (!confirmResult.rewardsCreated || (Array.isArray(confirmResult.rewardsCreated) && confirmResult.rewardsCreated.length === 0))) {
+      try {
+        await processReferralRewardForDepositAsync(deposit.id, verifiedAmount, deposit.userId);
+      } catch (refErr: any) {
+        console.warn(`[Referral Reward Warning] Failed to process referral reward for deposit #${deposit.id}:`, refErr?.message || refErr);
+      }
+    }
 
     return {
       success: true,
@@ -326,13 +473,15 @@ export async function verifyDepositOnChainAsync(
     actualAmount: verifiedAmount,
   });
 
+  const authoritativeReqConf = verification.requiredConfirmations || Number(deposit.requiredConfirmations);
+
   return {
     success: true,
     deposit: updatedDeposit,
     isPendingConfirmations: true,
     confirmations: verification.confirmations || 0,
-    requiredConfirmations: verification.requiredConfirmations || 12,
-    message: `Transaction has ${verification.confirmations || 0} of ${verification.requiredConfirmations || 12} required BSC confirmations.`,
+    requiredConfirmations: authoritativeReqConf,
+    message: `Transaction has ${verification.confirmations || 0} of ${authoritativeReqConf} required BSC confirmations.`,
   };
 }
 
@@ -352,6 +501,12 @@ export async function updateDepositStatusAsync(
     return { success: false, error: 'This deposit has already been confirmed.' };
   }
 
+  if (status === 'rejected' && deposit.status === 'rejected') {
+    return { success: false, error: 'This deposit has already been rejected.' };
+  }
+
+  const now = new Date().toISOString();
+
   if (status === 'confirmed') {
     const confirmResult = await confirmDepositAtomic({
       depositId: deposit.id,
@@ -365,26 +520,40 @@ export async function updateDepositStatusAsync(
       return { success: false, error: confirmResult.error || 'Failed to confirm deposit.' };
     }
 
-    const balance = await calculateUserBalanceAsync(deposit.userId);
-    await createLedgerEntry({
-      userId: deposit.userId,
-      type: 'deposit',
-      amount: deposit.amount,
-      balanceAfter: balance.availableBalance,
-      referenceId: deposit.id,
-      description: `Admin approved deposit of ${deposit.amount} USDT`,
-      createdAt: new Date().toISOString(),
-      performedBy: adminId,
-    });
+    if (!confirmResult.ledgerCreatedInDb) {
+      const balance = await calculateUserBalanceAsync(deposit.userId);
+      await createLedgerEntry({
+        userId: deposit.userId,
+        type: 'deposit',
+        amount: deposit.amount,
+        balanceAfter: balance.availableBalance,
+        referenceId: deposit.id,
+        description: `Admin approved deposit of ${deposit.amount} USDT`,
+        createdAt: now,
+        performedBy: adminId,
+      });
 
-    await createAuditLog({
-      action: 'DEPOSIT_APPROVED',
-      actorId: adminId,
-      actorRole: 'admin',
-      targetUserId: deposit.userId,
-      reason: adminNotes || `Admin approved deposit #${deposit.id} for ${deposit.amount} USDT`,
-      timestamp: new Date().toISOString(),
-    });
+      await createAuditLog({
+        action: 'DEPOSIT_APPROVED',
+        actorId: adminId,
+        actorRole: 'admin',
+        targetUserId: deposit.userId,
+        reason: adminNotes || `Admin approved deposit #${deposit.id} for ${deposit.amount} USDT`,
+        timestamp: now,
+        referenceId: String(deposit.id),
+        beforeValue: { status: deposit.status },
+        afterValue: { status: 'confirmed', amount: deposit.amount },
+      });
+    }
+
+    // Authoritative Referral Reward Processing
+    if (!confirmResult.rewardsCreated || (Array.isArray(confirmResult.rewardsCreated) && confirmResult.rewardsCreated.length === 0)) {
+      try {
+        await processReferralRewardForDepositAsync(deposit.id, deposit.actualAmount || deposit.amount, deposit.userId);
+      } catch (refErr: any) {
+        console.warn(`[Referral Reward Warning] Failed to process referral reward for deposit #${deposit.id}:`, refErr?.message || refErr);
+      }
+    }
 
     return { success: true, deposit: confirmResult.deposit };
   }
@@ -393,6 +562,8 @@ export async function updateDepositStatusAsync(
   const updated = await updateDeposit(depositId, {
     status: 'rejected',
     adminNotes,
+    reviewedBy: adminId,
+    reviewedAt: now,
     txHash: txHash || deposit.txHash,
   });
 
@@ -402,7 +573,10 @@ export async function updateDepositStatusAsync(
     actorRole: 'admin',
     targetUserId: deposit.userId,
     reason: adminNotes || `Admin rejected deposit #${deposit.id}`,
-    timestamp: new Date().toISOString(),
+    timestamp: now,
+    referenceId: String(deposit.id),
+    beforeValue: { status: deposit.status },
+    afterValue: { status: 'rejected' },
   });
 
   return { success: true, deposit: updated };

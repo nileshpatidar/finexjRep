@@ -1,4 +1,4 @@
-import { getServerSupabase } from '../supabase';
+import { getServerSupabase, isServerSupabaseReady } from '../supabase';
 import { Withdrawal, WithdrawalStatus } from '../types';
 import { resolveUserIdForDb } from './profiles';
 
@@ -13,23 +13,22 @@ export function mapDbWithdrawalToWithdrawal(w: any): Withdrawal {
 
   let reqAmount = Number(w.requested_amount || w.amount || w.requestedAmount || 0);
 
+  let feePct = 0;
+  if (w.fee_percentage !== undefined && w.fee_percentage !== null && !isNaN(Number(w.fee_percentage))) {
+    feePct = Number(w.fee_percentage);
+  } else if (reqAmount > 0 && feeAmt > 0) {
+    feePct = Math.round(((feeAmt / reqAmount) * 100) * 100) / 100;
+  }
+
   if (reqAmount <= 0 && (netAmt > 0 || feeAmt > 0)) {
     reqAmount = Number((netAmt + feeAmt).toFixed(4));
   } else if (reqAmount > 0 && netAmt <= 0 && feeAmt <= 0) {
-    const defaultFeePct = w.fee_percentage !== undefined && w.fee_percentage !== null ? Number(w.fee_percentage) : 6;
-    feeAmt = Number((reqAmount * (defaultFeePct / 100)).toFixed(4));
+    feeAmt = Number((reqAmount * (feePct / 100)).toFixed(4));
     netAmt = Number((reqAmount - feeAmt).toFixed(4));
   } else if (reqAmount > 0 && netAmt > 0 && feeAmt <= 0) {
     feeAmt = Math.max(0, Number((reqAmount - netAmt).toFixed(4)));
   } else if (reqAmount > 0 && feeAmt > 0 && netAmt <= 0) {
     netAmt = Math.max(0, Number((reqAmount - feeAmt).toFixed(4)));
-  }
-
-  let feePct = 6;
-  if (w.fee_percentage !== undefined && w.fee_percentage !== null && Number(w.fee_percentage) > 0) {
-    feePct = Number(w.fee_percentage);
-  } else if (reqAmount > 0 && feeAmt > 0) {
-    feePct = Math.round(((feeAmt / reqAmount) * 100) * 100) / 100;
   }
 
   const appStatus = (w.status === 'completed' ? 'paid' : (w.status || 'pending')) as WithdrawalStatus;
@@ -113,7 +112,10 @@ export async function getWithdrawalByIdempotencyKey(key: string): Promise<Withdr
 export async function createWithdrawal(wd: Partial<Withdrawal>): Promise<Withdrawal> {
   const destination = (wd.destinationAddress || '').trim();
   const amount = Number(wd.requestedAmount || 0);
-  const feePct = wd.feePercentage !== undefined ? Number(wd.feePercentage) : 6;
+  if (wd.feePercentage === undefined || isNaN(Number(wd.feePercentage))) {
+    throw new Error('Authoritative feePercentage is required to create a withdrawal.');
+  }
+  const feePct = Number(wd.feePercentage);
   const feeAmount = wd.feeAmount !== undefined ? Number(wd.feeAmount) : Number((amount * (feePct / 100)).toFixed(4));
   const netAmount = wd.netAmount !== undefined ? Number(wd.netAmount) : Number((amount - feeAmount).toFixed(4));
 
@@ -207,20 +209,83 @@ export async function updateWithdrawal(id: string, updates: Partial<Withdrawal>)
   return mapDbWithdrawalToWithdrawal(data);
 }
 
-export async function getAllWithdrawals(options?: {
+export interface GetAllWithdrawalsOptions {
   page?: number;
   limit?: number;
   status?: string;
-}): Promise<{ withdrawals: Withdrawal[]; total: number }> {
+  search?: string;
+  userId?: string;
+  userIds?: string[];
+  walletAddress?: string;
+  txHash?: string;
+  minAmount?: number;
+  maxAmount?: number;
+  startDate?: string;
+  endDate?: string;
+}
+
+export async function getAllWithdrawals(options?: GetAllWithdrawalsOptions): Promise<{ withdrawals: Withdrawal[]; total: number }> {
   const supabase = getServerSupabase();
-  const page = options?.page || 1;
-  const limit = options?.limit || 500;
+  const page = Math.max(1, Number(options?.page) || 1);
+  const limit = Math.min(100, Math.max(1, Number(options?.limit) || 20));
   const offset = (page - 1) * limit;
 
   let query = supabase.from('withdrawals').select('*', { count: 'exact' });
 
   if (options?.status && options.status !== 'all') {
-    query = query.eq('status', options.status);
+    if (options.status === 'paid') {
+      query = query.or('status.eq.paid,status.eq.completed');
+    } else {
+      query = query.eq('status', options.status);
+    }
+  }
+
+  if (options?.userId) {
+    if (!isNaN(Number(options.userId))) {
+      query = query.or(`user_id.eq.${options.userId},user_id.eq.${Number(options.userId)}`);
+    } else {
+      query = query.eq('user_id', options.userId);
+    }
+  }
+
+  if (options?.userIds && options.userIds.length > 0) {
+    query = query.in('user_id', options.userIds);
+  }
+
+  if (options?.walletAddress && options.walletAddress.trim()) {
+    query = query.ilike('destination_address', `%${options.walletAddress.trim()}%`);
+  }
+
+  if (options?.txHash && options.txHash.trim()) {
+    const cleanHash = options.txHash.trim();
+    query = query.or(`tx_hash.ilike.%${cleanHash}%,payout_tx_hash.ilike.%${cleanHash}%`);
+  }
+
+  if (options?.minAmount !== undefined && !isNaN(Number(options.minAmount))) {
+    query = query.gte('requested_amount', Number(options.minAmount));
+  }
+
+  if (options?.maxAmount !== undefined && !isNaN(Number(options.maxAmount))) {
+    query = query.lte('requested_amount', Number(options.maxAmount));
+  }
+
+  if (options?.startDate) {
+    query = query.gte('created_at', options.startDate);
+  }
+
+  if (options?.endDate) {
+    query = query.lte('created_at', options.endDate);
+  }
+
+  if (options?.search && options.search.trim()) {
+    const term = options.search.trim().replace(/[%_]/g, '');
+    if (term) {
+      if (!isNaN(Number(term))) {
+        query = query.or(`reference.ilike.%${term}%,destination_address.ilike.%${term}%,tx_hash.ilike.%${term}%,id.eq.${Number(term)},user_id.eq.${Number(term)}`);
+      } else {
+        query = query.or(`reference.ilike.%${term}%,destination_address.ilike.%${term}%,tx_hash.ilike.%${term}%,payout_tx_hash.ilike.%${term}%`);
+      }
+    }
   }
 
   const { data, count, error } = await query
@@ -233,6 +298,157 @@ export async function getAllWithdrawals(options?: {
   }
 
   const withdrawals = (data || []).map(mapDbWithdrawalToWithdrawal);
-  return { withdrawals, total: count || withdrawals.length };
+  return { withdrawals, total: count !== null && count !== undefined ? count : withdrawals.length };
 }
+
+export interface CreateWithdrawalAtomicInput {
+  userId: number | string;
+  requestedAmount: number;
+  destinationAddress: string;
+  reference: string;
+  idempotencyKey?: string;
+  userNotes?: string;
+  feePercentage?: number;
+  feeAmount?: number;
+  netAmount?: number;
+  fundLockDays?: number;
+  confirmLockBreak?: boolean;
+  confirmMinimumBreak?: boolean;
+}
+
+export async function createWithdrawalAtomic(input: CreateWithdrawalAtomicInput): Promise<{
+  success: boolean;
+  withdrawal?: Withdrawal;
+  isDuplicate?: boolean;
+  requiresConfirmation?: boolean;
+  warningType?: 'LOCK_BREAK_WARNING' | 'MINIMUM_FUND_WARNING';
+  error?: string;
+}> {
+  if (!isServerSupabaseReady()) {
+    return { success: false, error: 'Database service is running in local offline mode.' };
+  }
+
+  try {
+    const supabase = getServerSupabase();
+    let numericUserId: number | null = null;
+    if (!isNaN(Number(input.userId)) && Number(input.userId) > 0) {
+      numericUserId = Number(input.userId);
+    } else {
+      const resolved = await resolveUserIdForDb(input.userId);
+      if (typeof resolved === 'number' && resolved > 0) {
+        numericUserId = resolved;
+      }
+    }
+
+    if (!numericUserId) {
+      return { success: false, error: `User account (${input.userId}) not found or invalid.` };
+    }
+
+    const { data, error } = await supabase.rpc('create_withdrawal_atomic', {
+      p_user_id: numericUserId,
+      p_requested_amount: input.requestedAmount,
+      p_destination_address: input.destinationAddress.trim(),
+      p_reference: input.reference,
+      p_idempotency_key: input.idempotencyKey || null,
+      p_user_notes: input.userNotes || null,
+      p_fee_percentage: input.feePercentage ?? null,
+      p_fee_amount: input.feeAmount ?? null,
+      p_net_amount: input.netAmount ?? null,
+      p_fund_lock_days: input.fundLockDays ?? 0,
+      p_confirm_lock_break: input.confirmLockBreak ?? false,
+      p_confirm_minimum_break: input.confirmMinimumBreak ?? false,
+    });
+
+    if (error) {
+      console.error('[Supabase RPC Error] create_withdrawal_atomic:', error.message);
+      return { success: false, error: error.message };
+    }
+
+    if (!data || !data.success) {
+      return {
+        success: false,
+        isDuplicate: data?.is_duplicate === true,
+        requiresConfirmation: data?.requires_confirmation === true,
+        warningType: data?.warning_type,
+        error: data?.error || 'Atomic withdrawal creation failed.',
+        withdrawal: data?.withdrawal ? mapDbWithdrawalToWithdrawal(data.withdrawal) : undefined,
+      };
+    }
+
+    return {
+      success: true,
+      isDuplicate: data?.is_duplicate === true,
+      withdrawal: mapDbWithdrawalToWithdrawal(data.withdrawal),
+    };
+  } catch (err: any) {
+    console.error('[createWithdrawalAtomic Exception]:', err?.message);
+    return { success: false, error: err?.message || 'Unexpected failure in createWithdrawalAtomic' };
+  }
+}
+
+export interface ProcessWithdrawalStatusAtomicInput {
+  adminId: string;
+  adminRole?: string;
+  withdrawalId: number | string;
+  newStatus: string;
+  txHash?: string;
+  adminNotes?: string;
+}
+
+export async function processWithdrawalStatusAtomic(input: ProcessWithdrawalStatusAtomicInput): Promise<{
+  success: boolean;
+  withdrawal?: Withdrawal;
+  error?: string;
+}> {
+  if (!isServerSupabaseReady()) {
+    return { success: false, error: 'Database service is running in local offline mode.' };
+  }
+
+  try {
+    const supabase = getServerSupabase();
+    let numericId: number | null = null;
+    if (!isNaN(Number(input.withdrawalId)) && Number(input.withdrawalId) > 0) {
+      numericId = Number(input.withdrawalId);
+    } else {
+      const existing = await getWithdrawalById(String(input.withdrawalId));
+      if (existing && !isNaN(Number(existing.id)) && Number(existing.id) > 0) {
+        numericId = Number(existing.id);
+      }
+    }
+
+    if (!numericId) {
+      return { success: false, error: `Withdrawal record (${input.withdrawalId}) not found in database.` };
+    }
+
+    const { data, error } = await supabase.rpc('process_withdrawal_status_atomic', {
+      p_admin_id: input.adminId,
+      p_admin_role: input.adminRole || 'admin',
+      p_withdrawal_id: numericId,
+      p_new_status: input.newStatus,
+      p_tx_hash: input.txHash ? input.txHash.trim().toLowerCase() : null,
+      p_admin_notes: input.adminNotes || null,
+    });
+
+    if (error) {
+      console.error('[Supabase RPC Error] process_withdrawal_status_atomic:', error.message);
+      return { success: false, error: error.message };
+    }
+
+    if (!data || !data.success) {
+      return {
+        success: false,
+        error: data?.error || 'Atomic withdrawal status update failed.',
+      };
+    }
+
+    return {
+      success: true,
+      withdrawal: mapDbWithdrawalToWithdrawal(data.withdrawal),
+    };
+  } catch (err: any) {
+    console.error('[processWithdrawalStatusAtomic Exception]:', err?.message);
+    return { success: false, error: err?.message || 'Unexpected failure in processWithdrawalStatusAtomic' };
+  }
+}
+
 

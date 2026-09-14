@@ -1,5 +1,6 @@
 import { getSettings } from './repositories/settings';
 import { getDepositByTxHash } from './repositories/deposits';
+import { logger } from './logger';
 
 export interface VerificationResult {
   isValid: boolean;
@@ -90,7 +91,7 @@ export function normalizeAddress(address?: string | null): string {
  */
 export function isValidBEP20Address(address: string): boolean {
   if (!address || typeof address !== 'string') return false;
-  return /^0x[a-fA-F0-9]{40}$/.test(address.trim());
+  return /^0x[a-fA-F0-9]{40}$/i.test(address.trim());
 }
 
 /**
@@ -249,20 +250,23 @@ export async function verifyBEP20Deposit(
   overrideToAddress?: string,
   overrideContract?: string
 ): Promise<VerificationResult> {
-  let settings: any = {};
+  const normalizedHash = txHash ? txHash.trim().toLowerCase() : '';
+
+  let settings: any;
   try {
     settings = await getSettings();
-  } catch (err) {
-    // Fallback if settings repository is in-memory or DB offline
-    settings = {
-      requiredConfirmations: DEFAULT_REQUIRED_CONFIRMATIONS,
-      minimumDepositAmount: 300,
-      bep20DepositAddress: DEFAULT_BSC_DEPOSIT_WALLET,
-      usdtContractAddress: CANONICAL_BSC_USDT_CONTRACT,
+  } catch (err: any) {
+    logger.error('BLOCKCHAIN_CONFIG_ERROR', 'Failed to retrieve authoritative blockchain settings. Blocking verification.', { metadata: { error: err?.message } });
+    return {
+      isValid: false,
+      txHash: normalizedHash,
+      confirmations: 0,
+      requiredConfirmations: 0,
+      status: 'invalid',
+      errorCode: 'CONFIG_ERROR',
+      errorMessage: 'Blockchain configuration is temporarily unavailable. Verification blocked.',
     };
   }
-
-  const normalizedHash = txHash ? txHash.trim().toLowerCase() : '';
 
   // 1. Transaction Hash Syntax Validation
   if (!isValidTxHash(normalizedHash)) {
@@ -270,7 +274,7 @@ export async function verifyBEP20Deposit(
       isValid: false,
       txHash: normalizedHash,
       confirmations: 0,
-      requiredConfirmations: settings.requiredConfirmations || DEFAULT_REQUIRED_CONFIRMATIONS,
+      requiredConfirmations: Number(settings.requiredConfirmations) || 0,
       status: 'invalid',
       errorCode: 'INVALID_TX_HASH_FORMAT',
       errorMessage: 'Invalid transaction hash format. Must be a 66-character hexadecimal string starting with 0x.',
@@ -295,28 +299,31 @@ export async function verifyBEP20Deposit(
     // Continue with verification if repository is unreachable
   }
 
-  // 3. Resolve Configured Blockchain Parameters
+  // 3. Resolve Configured Blockchain Parameters (Strict Authority)
   const configuredContract = (
     overrideContract ||
-    process.env.BSC_USDT_CONTRACT_ADDRESS ||
-    settings.usdtContractAddress ||
-    CANONICAL_BSC_USDT_CONTRACT
-  ).trim();
+    settings.usdtContractAddress
+  )?.trim();
 
   const configuredDepositWallet = (
     overrideToAddress ||
-    process.env.BSC_DEPOSIT_WALLET_ADDRESS ||
-    settings.bep20DepositAddress ||
-    DEFAULT_BSC_DEPOSIT_WALLET
-  ).trim();
+    settings.bep20DepositAddress
+  )?.trim();
 
-  const requiredConfirmations = Number(
-    process.env.BSC_REQUIRED_CONFIRMATIONS ||
-    settings.requiredConfirmations ||
-    DEFAULT_REQUIRED_CONFIRMATIONS
-  );
+  const requiredConfirmations = Number(settings.requiredConfirmations);
+  const minDeposit = Number(settings.minimumDepositAmount);
 
-  const minDeposit = Number(settings.minimumDepositAmount || 300);
+  if (!configuredContract || !configuredDepositWallet || isNaN(requiredConfirmations) || isNaN(minDeposit)) {
+    return {
+      isValid: false,
+      txHash: normalizedHash,
+      confirmations: 0,
+      requiredConfirmations: 0,
+      status: 'invalid',
+      errorCode: 'CONFIG_ERROR',
+      errorMessage: 'Blockchain configuration is invalid or missing required parameters. Verification blocked.',
+    };
+  }
 
   // 4. Query Real BSC Node via JSON-RPC
   let txData: any = null;
@@ -324,11 +331,25 @@ export async function verifyBEP20Deposit(
   let latestBlockHex: string | null = null;
 
   try {
-    const [tx, receipt, latestBlock] = await Promise.all([
+    const [tx, receipt, latestBlock, chainIdHex] = await Promise.all([
       callBscRpc<any>('eth_getTransactionByHash', [normalizedHash]),
       callBscRpc<any>('eth_getTransactionReceipt', [normalizedHash]),
       callBscRpc<string>('eth_blockNumber', []),
+      callBscRpc<string>('eth_chainId', []).catch(() => BSC_CHAIN_ID_HEX),
     ]);
+
+    // Verify BSC Chain ID is 56 (0x38)
+    if (chainIdHex && parseInt(chainIdHex, 16) !== BSC_CHAIN_ID_DECIMAL) {
+      return {
+        isValid: false,
+        txHash: normalizedHash,
+        confirmations: 0,
+        requiredConfirmations,
+        status: 'invalid',
+        errorCode: 'CHAIN_ID_MISMATCH',
+        errorMessage: `RPC network mismatch. Connected to Chain ID ${parseInt(chainIdHex, 16)}, but expected BSC Mainnet (Chain ID 56).`,
+      };
+    }
 
     txData = tx;
     receiptData = receipt;
@@ -532,21 +553,28 @@ export async function verifyBEP20PayoutTx(
     currentWithdrawalId?: string;
   }
 ): Promise<PayoutVerificationResult> {
-  let settings: any = {};
+  const normalizedHash = txHash ? txHash.trim().toLowerCase() : '';
+  const normalizedRecipient = normalizeAddress(expectedRecipientAddress);
+
+  let settings: any;
   try {
     settings = await getSettings();
-  } catch (err) {
-    settings = {
-      requiredConfirmations: DEFAULT_REQUIRED_CONFIRMATIONS,
-      usdtContractAddress: CANONICAL_BSC_USDT_CONTRACT,
+  } catch (err: any) {
+    logger.error('BLOCKCHAIN_CONFIG_ERROR', 'Failed to retrieve authoritative blockchain settings. Blocking payout verification.', { metadata: { error: err?.message } });
+    return {
+      isValid: false,
+      txHash: normalizedHash,
+      confirmations: 0,
+      requiredConfirmations: 0,
+      status: 'invalid',
+      errorCode: 'CONFIG_ERROR',
+      errorMessage: 'Blockchain configuration is temporarily unavailable. Payout verification blocked.',
     };
   }
 
-  const normalizedHash = txHash ? txHash.trim().toLowerCase() : '';
-  const normalizedRecipient = normalizeAddress(expectedRecipientAddress);
   const requiredConfirmations = options?.minConfirmations !== undefined
     ? options.minConfirmations
-    : Math.min(1, Number(settings.requiredConfirmations || 1));
+    : Number(settings.requiredConfirmations);
 
   // 1. Transaction Hash Syntax Validation
   if (!isValidTxHash(normalizedHash)) {
@@ -727,7 +755,7 @@ export async function verifyBEP20PayoutTx(
   const totalTransferred = matchingTransfers.reduce((acc, t) => acc + t.amount, 0);
   const primarySender = matchingTransfers[0].fromAddress || normalizeAddress(txData.from);
 
-  // 10. Verify Transferred Amount vs Expected Net Amount (allowing 0.0001 precision tolerance)
+  // 10. Verify Transferred Amount vs Expected Net Amount (allowing micro-precision tolerance)
   const minRequiredAmount = Number(expectedMinNetAmount || 0);
   if (minRequiredAmount > 0 && totalTransferred < minRequiredAmount - 0.0001) {
     return {
@@ -744,6 +772,24 @@ export async function verifyBEP20PayoutTx(
       status: 'invalid',
       errorCode: 'INSUFFICIENT_AMOUNT',
       errorMessage: `Transferred USDT amount ($${totalTransferred.toFixed(2)}) is less than the required net payout amount ($${minRequiredAmount.toFixed(2)} USDT).`,
+    };
+  }
+
+  if (minRequiredAmount > 0 && totalTransferred > minRequiredAmount + 0.05) {
+    return {
+      isValid: false,
+      amount: totalTransferred,
+      expectedAmount: minRequiredAmount,
+      fromAddress: primarySender,
+      toAddress: normalizedRecipient,
+      tokenContract: configuredContract,
+      confirmations,
+      requiredConfirmations,
+      txHash: normalizedHash,
+      blockNumber: txBlockNumber,
+      status: 'invalid',
+      errorCode: 'EXCESSIVE_AMOUNT',
+      errorMessage: `Transferred USDT amount ($${totalTransferred.toFixed(2)}) exceeds the expected net payout amount ($${minRequiredAmount.toFixed(2)} USDT). Must match expected net payout.`,
     };
   }
 

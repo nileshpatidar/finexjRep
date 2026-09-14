@@ -24,9 +24,15 @@ export interface User {
   lastWithdrawalAt?: string;
   walletAddress?: string;
   isLocked?: boolean;
+  referralCode?: string;
+  referrerId?: string;
+  isFlaggedForReview?: boolean;
+  riskScore?: number;
+  fraudFlags?: string[];
+  isTestUser?: boolean;
 }
 
-export type DepositStatus = 'pending' | 'confirming' | 'confirmed' | 'rejected';
+export type DepositStatus = 'pending' | 'confirming' | 'confirmed' | 'rejected' | 'failed';
 
 export interface Deposit {
   id: string;
@@ -56,14 +62,26 @@ export interface Deposit {
   notes?: string;
 }
 
-export type WithdrawalStatus = 'pending' | 'under_review' | 'approved' | 'processing' | 'paid' | 'rejected' | 'cancelled';
+export type WithdrawalStatus = 
+  | 'pending' 
+  | 'under_review' 
+  | 'approved' 
+  | 'processing' 
+  | 'manual_payment_pending' 
+  | 'payment_submitted' 
+  | 'payment_verified' 
+  | 'paid' 
+  | 'completed' 
+  | 'complete' 
+  | 'rejected' 
+  | 'cancelled';
 
 export interface Withdrawal {
   id: string;
   reference: string;
   userId: string;
   requestedAmount: number;
-  feePercentage: number; // Configurable / Default 6%
+  feePercentage: number; // Configurable / Authoritative Default 9%
   feeAmount: number;
   netAmount: number;
   destinationAddress: string;
@@ -112,10 +130,13 @@ export type LedgerType =
   | 'deposit' 
   | 'daily_earnings' 
   | 'daily_loss'
+  | 'referral_reward_l1'
+  | 'referral_reward_l2'
   | 'withdrawal_request' 
   | 'withdrawal_fee' 
   | 'withdrawal_paid' 
   | 'withdrawal_rejected' 
+  | 'withdrawal_cancelled'
   | 'admin_adjustment' 
   | 'reversal';
 
@@ -135,6 +156,9 @@ export interface UserBalanceSummary {
   userId: string;
   totalDeposited: number;
   totalEarnings: number;
+  referralEarnings: number;
+  activeCompoundingPrincipal: number;
+  depositLockedPrincipal: number;
   totalWithdrawn: number;
   totalFeesPaid: number;
   totalPendingWithdrawals: number;
@@ -173,7 +197,10 @@ export interface AppSettings {
   usdtContractAddress: string;
   requiredConfirmations: number;
   minimumDepositAmount: number; // 300 USDT
-  withdrawalFeePercentage: number; // Configurable / Default 6%
+  withdrawalFeePercentage: number; // Configurable / Default 9%
+  companyReferralCode: string; // Default 'FINEXJ'
+  referralRewardL1Percentage: number; // Default 5%
+  referralRewardL2Percentage: number; // Default 2%
   accountAgeRequirementDays: number; // 30
   depositLockPeriodDays: number; // 30
   telegramSupportUrl: string;
@@ -194,3 +221,245 @@ export interface MarketPrice {
   lastUpdated: string;
   isAvailable: boolean;
 }
+
+export interface MarketAssetTicker {
+  price: number | null;
+  change24h: number | null;
+  currency: string;
+  unit?: string;
+  isAvailable?: boolean;
+}
+
+export interface MarketTickerResponse {
+  btc: {
+    price: number | null;
+    change24h: number | null;
+    currency: string;
+    isAvailable?: boolean;
+  };
+  gold: {
+    price: number | null;
+    change24h: number | null;
+    currency: string;
+    unit: string;
+    isAvailable?: boolean;
+  };
+  updatedAt: string;
+  isStale?: boolean;
+}
+
+export interface Referral {
+  id: string;
+  referrerId: string;
+  referredId: string;
+  referralCodeUsed?: string;
+  status: 'active' | 'flagged' | 'revoked';
+  createdAt: string;
+}
+
+export interface ReferralReward {
+  id: string;
+  referralId?: string;
+  referrerId: string;
+  referredId: string;
+  depositId: string;
+  amount: number;
+  percentage: number;
+  reference: string;
+  status: 'credited' | 'pending_review' | 'flagged' | 'reversed';
+  rewardLevel?: number; // 1 (Direct) or 2 (Indirect)
+  eventType?: string; // 'qualifying_deposit'
+  notes?: string;
+  createdAt: string;
+}
+
+export interface FinexjOperationalEntry {
+  id: number | string;
+  amount: number;
+  direction: 'inflow' | 'outflow';
+  reason: string;
+  adminId: string;
+  reference?: string;
+  beforeBalance: number;
+  afterBalance: number;
+  createdAt: string;
+}
+
+export interface FinexjOperationalSummary {
+  currentBalance: number;
+  totalInflow: number;
+  totalOutflow: number;
+  totalFeeIncome: number;
+  recentEntries: FinexjOperationalEntry[];
+}
+
+export interface ReferralAccountingSummary {
+  totalRewardsCount: number;
+  totalRewardsAmount: number;
+  level1RewardsAmount: number;
+  level2RewardsAmount: number;
+  uniqueReferrersCount: number;
+  totalReferralsCount: number;
+  qualifyingReferralsCount: number;
+  todayRewardsAmount: number;
+  recentRewards: {
+    id: string;
+    referrerId: string;
+    referrerEmail?: string;
+    referredId: string;
+    referredEmail?: string;
+    rewardLevel: number;
+    qualifyingDepositAmount: number;
+    depositId?: string;
+    rewardPercentage: number;
+    amount: number;
+    status: string;
+    createdAt: string;
+  }[];
+}
+
+export interface UserReferralSummary {
+  referralCode: string;
+  referralLink: string;
+  totalReferrals: number;
+  level1Referrals: number;
+  level2Referrals: number;
+  totalReferralIncome: number;
+  level1Income: number;
+  level2Income: number;
+  eligibleDepositPrincipal: number; // Strictly separated from referral income
+  isEligible: boolean; // Authoritative backend eligibility flag
+  hasConfirmedDeposit: boolean;
+  maintainedEligiblePrincipal: number; // Confirmed deposits - paid withdrawals
+  minimumRequiredPrincipal: number; // Dynamic from system_settings.minimumDepositAmount
+  ineligibilityReason?: string;
+}
+
+export interface ReferralEligibilityResult {
+  isEligible: boolean;
+  hasConfirmedDeposit: boolean;
+  totalDeposited: number;
+  totalWithdrawn: number;
+  maintainedEligiblePrincipal: number;
+  minimumRequiredPrincipal: number;
+  reason?: string;
+}
+
+export interface Level1ReferralItem {
+  id: string;
+  name: string;
+  surname: string;
+  status: string;
+  isQualified: boolean;
+  rewardEarned: number; // Income generated for the current user
+  level2Count: number; // Sub-referrals count under this L1 member
+  joinedAt: string;
+}
+
+export interface Level2ReferralItem {
+  id: string;
+  name: string;
+  surname: string;
+  status: string;
+  isQualified: boolean;
+  rewardEarned: number; // Income generated for the current user
+  joinedAt: string;
+  level1ReferrerId: string;
+  level1ReferrerName: string;
+}
+
+export interface PaginatedLevel1ReferralsResponse {
+  items: Level1ReferralItem[];
+  page: number;
+  limit: number;
+  totalCount: number;
+  totalPages: number;
+}
+
+export interface PaginatedLevel2ReferralsResponse {
+  items: Level2ReferralItem[];
+  page: number;
+  limit: number;
+  totalCount: number;
+  totalPages: number;
+  level1ReferrerName?: string;
+  level1ReferrerId?: string;
+}
+
+export interface AccountingTodayBreakdown {
+  deposits: number;
+  dailyEarnings: number;
+  referralRewardsL1: number;
+  referralRewardsL2: number;
+  totalReferralRewards: number;
+  withdrawals: number;
+  withdrawalFees: number;
+  finexjRetainedFees: number;
+  operationalAdjustments: number;
+}
+
+export interface AdminAccountingSummary {
+  // Top summary cards
+  totalDeposited: number; // A. TOTAL CONFIRMED DEPOSITS
+  activeCompoundingPrincipal: number; // B. TOTAL ELIGIBLE USER PRINCIPAL
+  totalDailyEarningsDistributed: number; // C. DAILY EARNINGS CREDITED
+  totalReferralRewardsPaid: number; // D. REFERRAL REWARDS DISTRIBUTED
+  totalReferralRewardsL1: number;
+  totalReferralRewardsL2: number;
+  qualifyingReferralsCount: number;
+  totalWithdrawn: number; // E. TOTAL USER WITHDRAWALS (gross requested)
+  totalNetPayout: number; // Net paid out
+  totalFeesCollected: number; // F. TOTAL WITHDRAWAL FEES
+  finexjRetainedFees: number; // G. FINEXJ RETAINED FEE INCOME
+  withdrawalFeePercentage: number; // Configured fee % (e.g. 9.0)
+  operationalFundBalance: number; // H. FINEXJ OPERATIONAL FUND
+  operationalFundInflow: number;
+  operationalFundOutflow: number;
+  totalUserAvailableBalances: number;
+  expectedAccountingPosition: number;
+  reconciliationDifference: number; // I. RECONCILIATION DIFFERENCE
+  reconciliationStatus: 'BALANCED' | 'REQUIRES_REVIEW';
+  todayBreakdown: AccountingTodayBreakdown;
+  period: string;
+  startDate?: string;
+  endDate?: string;
+}
+
+export interface AdminLedgerItem {
+  id: string;
+  timestamp: string;
+  category: 'DEPOSIT' | 'DAILY_EARNING' | 'REFERRAL_REWARD_L1' | 'REFERRAL_REWARD_L2' | 'WITHDRAWAL' | 'WITHDRAWAL_FEE' | 'FINEXJ_OPERATIONAL_ADJUSTMENT';
+  type: string;
+  amount: number;
+  userId?: string;
+  userEmail?: string;
+  reference?: string;
+  balanceAfter?: number;
+  description: string;
+  metadata?: Record<string, any>;
+}
+
+export interface AdminLedgerResponse {
+  entries: AdminLedgerItem[];
+  total: number;
+  page: number;
+  limit: number;
+  totalPages: number;
+}
+
+export interface FraudSignal {
+  id: string;
+  signalType: 'duplicate_wallet' | 'rapid_cycle' | 'self_referral_attempt' | 'replay_tx' | 'high_auth_failures' | 'suspicious_payout';
+  severity: 'low' | 'medium' | 'high' | 'critical';
+  userId?: string;
+  targetUserId?: string;
+  walletAddress?: string;
+  txHash?: string;
+  details?: Record<string, any>;
+  status: 'open' | 'reviewed' | 'dismissed' | 'action_taken';
+  reviewedBy?: string;
+  reviewedAt?: string;
+  resolutionNotes?: string;
+  createdAt: string;
+}
+

@@ -1,8 +1,10 @@
-import { getServerSupabase } from '../supabase';
+import { getServerSupabase, isServerSupabaseReady } from '../supabase';
 import { EarningEntry } from '../types';
 import { getDailyPerformances } from './performances';
 import { getDepositsByUserId } from './deposits';
 import { getAllProfiles, resolveUserIdForDb } from './profiles';
+
+const devEarnings: EarningEntry[] = [];
 
 export function mapDbEarningToEarning(e: any): EarningEntry {
   return {
@@ -20,7 +22,27 @@ export function mapDbEarningToEarning(e: any): EarningEntry {
   };
 }
 
-export async function getEarningsByUserId(userId: string): Promise<EarningEntry[]> {
+export interface GetEarningsOptions {
+  page?: number;
+  pageSize?: number;
+}
+
+export interface PaginatedEarningsResult {
+  earnings: EarningEntry[];
+  page: number;
+  pageSize: number;
+  hasMore: boolean;
+  totalCount: number;
+}
+
+export async function getEarningsByUserId(
+  userId: string,
+  options?: GetEarningsOptions
+): Promise<EarningEntry[]> {
+  if (!isServerSupabaseReady()) {
+    return devEarnings.filter(e => String(e.userId) === String(userId));
+  }
+
   const supabase = getServerSupabase();
   let query = supabase.from('earnings').select('*');
   if (!isNaN(Number(userId))) {
@@ -29,18 +51,151 @@ export async function getEarningsByUserId(userId: string): Promise<EarningEntry[
     query = query.eq('user_id', userId);
   }
 
-  const { data, error } = await query.order('created_at', { ascending: false });
+  // Authoritative Database-Level Ordering: latest performance_date first
+  query = query.order('performance_date', { ascending: false });
+
+  if (options && options.pageSize !== undefined) {
+    const page = Math.max(0, options.page ?? 0);
+    const pageSize = Math.max(1, options.pageSize);
+    const from = page * pageSize;
+    const to = from + pageSize - 1;
+    query = query.range(from, to);
+  }
+
+  let { data, error } = await query;
+
+  if (error && error.message?.includes('column')) {
+    // Isolated fallback: only if performance_date is missing from legacy schema
+    let fallbackQuery = supabase.from('earnings').select('*');
+    if (!isNaN(Number(userId))) {
+      fallbackQuery = fallbackQuery.or(`user_id.eq.${userId},user_id.eq.${Number(userId)}`);
+    } else {
+      fallbackQuery = fallbackQuery.eq('user_id', userId);
+    }
+    fallbackQuery = fallbackQuery.order('date', { ascending: false });
+    if (options && options.pageSize !== undefined) {
+      const page = Math.max(0, options.page ?? 0);
+      const pageSize = Math.max(1, options.pageSize);
+      const from = page * pageSize;
+      const to = from + pageSize - 1;
+      fallbackQuery = fallbackQuery.range(from, to);
+    }
+    const fallbackRes = await fallbackQuery;
+    data = fallbackRes.data;
+    error = fallbackRes.error;
+  }
 
   if (error) {
     console.error(`[Supabase Error] getEarningsByUserId(${userId}):`, error.message);
     return [];
   }
 
-  return (data || []).map(mapDbEarningToEarning);
+  // Return mapped database records directly with ZERO redundant client-side sorting
+  const mapped = (data || []).map(mapDbEarningToEarning);
+  return mapped;
+}
+
+export async function getPaginatedEarningsByUserId(
+  userId: string,
+  options?: GetEarningsOptions
+): Promise<PaginatedEarningsResult> {
+  const page = Math.max(0, options?.page ?? 0);
+  const pageSize = Math.max(1, options?.pageSize ?? 30);
+  const from = page * pageSize;
+  const to = from + pageSize - 1;
+
+  if (!isServerSupabaseReady()) {
+    const userEarnings = devEarnings.filter(e => String(e.userId) === String(userId));
+    const paged = userEarnings.slice(from, to + 1);
+    return {
+      earnings: paged,
+      page,
+      pageSize,
+      hasMore: (from + paged.length) < userEarnings.length,
+      totalCount: userEarnings.length,
+    };
+  }
+
+  const supabase = getServerSupabase();
+  let query = supabase
+    .from('earnings')
+    .select('*', { count: 'exact' });
+
+  if (!isNaN(Number(userId))) {
+    query = query.or(`user_id.eq.${userId},user_id.eq.${Number(userId)}`);
+  } else {
+    query = query.eq('user_id', userId);
+  }
+
+  let { data, error, count } = await query
+    .order('performance_date', { ascending: false })
+    .range(from, to);
+
+  if (error && error.message?.includes('column')) {
+    // Isolated fallback: only if performance_date is missing from legacy schema
+    let fallbackQuery = supabase
+      .from('earnings')
+      .select('*', { count: 'exact' });
+
+    if (!isNaN(Number(userId))) {
+      fallbackQuery = fallbackQuery.or(`user_id.eq.${userId},user_id.eq.${Number(userId)}`);
+    } else {
+      fallbackQuery = fallbackQuery.eq('user_id', userId);
+    }
+
+    const fallbackRes = await fallbackQuery
+      .order('date', { ascending: false })
+      .range(from, to);
+
+    data = fallbackRes.data;
+    error = fallbackRes.error;
+    count = fallbackRes.count;
+  }
+
+  if (error && error.message?.includes('Requested range not satisfiable')) {
+    return { earnings: [], page, pageSize, hasMore: false, totalCount: count ?? 0 };
+  }
+
+  if (error) {
+    console.error(`[Supabase Error] getPaginatedEarningsByUserId(${userId}):`, error.message);
+    return { earnings: [], page, pageSize, hasMore: false, totalCount: 0 };
+  }
+
+  // Map database response directly without client-side array re-sorting
+  const mapped = (data || []).map(mapDbEarningToEarning);
+  const totalCount = count ?? 0;
+  const hasMore = (from + mapped.length) < totalCount;
+
+  return {
+    earnings: mapped,
+    page,
+    pageSize,
+    hasMore,
+    totalCount,
+  };
 }
 
 export async function createEarning(entry: Partial<EarningEntry>): Promise<EarningEntry> {
   const targetDate = entry.performanceDate || new Date().toISOString().split('T')[0];
+
+  if (!isServerSupabaseReady()) {
+    const created: EarningEntry = {
+      id: String(Date.now()),
+      userId: String(entry.userId || '0'),
+      calculationId: String(entry.calculationId || '0'),
+      baseEligibleAmount: entry.baseEligibleAmount || 0,
+      applicableRate: entry.applicableRate || 0,
+      earningsAmount: entry.earningsAmount || 0,
+      performanceDate: targetDate,
+      createdAt: entry.createdAt || new Date().toISOString(),
+      status: entry.status || 'credited',
+      marketCondition: entry.marketCondition || ((entry.applicableRate || 0) >= 0 ? 'profit' : 'loss'),
+      note: entry.note,
+    };
+    devEarnings.push(created);
+    return created;
+  }
+
   const supabase = getServerSupabase();
   const resolvedUserId = await resolveUserIdForDb(entry.userId);
   const perfIdNum = entry.calculationId && !isNaN(Number(entry.calculationId))
@@ -122,6 +277,14 @@ export async function createEarning(entry: Partial<EarningEntry>): Promise<Earni
 }
 
 export async function deleteEarningsByDate(date: string): Promise<void> {
+  if (!isServerSupabaseReady()) {
+    const idx = devEarnings.findIndex(e => e.performanceDate === date);
+    if (idx !== -1) {
+      devEarnings.splice(idx, 1);
+    }
+    return;
+  }
+
   const supabase = getServerSupabase();
   const { error } = await supabase
     .from('earnings')
@@ -151,14 +314,46 @@ export async function createEarningsBatch(entries: Partial<EarningEntry>[]): Pro
   return results;
 }
 
-export async function getAllEarnings(): Promise<EarningEntry[]> {
+export async function getAllEarnings(options?: GetEarningsOptions): Promise<EarningEntry[]> {
+  if (!isServerSupabaseReady()) {
+    return devEarnings;
+  }
+
   try {
     const supabase = getServerSupabase();
-    const { data, error } = await supabase
+    let query = supabase
       .from('earnings')
       .select('*')
-      .order('created_at', { ascending: false })
-      .limit(500);
+      .order('performance_date', { ascending: false });
+
+    if (options && options.pageSize !== undefined) {
+      const page = Math.max(0, options.page ?? 0);
+      const pageSize = Math.max(1, options.pageSize);
+      const from = page * pageSize;
+      const to = from + pageSize - 1;
+      query = query.range(from, to);
+    }
+
+    let { data, error } = await query;
+
+    if (error && error.message?.includes('column')) {
+      let fallbackQuery = supabase
+        .from('earnings')
+        .select('*')
+        .order('date', { ascending: false });
+
+      if (options && options.pageSize !== undefined) {
+        const page = Math.max(0, options.page ?? 0);
+        const pageSize = Math.max(1, options.pageSize);
+        const from = page * pageSize;
+        const to = from + pageSize - 1;
+        fallbackQuery = fallbackQuery.range(from, to);
+      }
+
+      const fallback = await fallbackQuery;
+      data = fallback.data;
+      error = fallback.error;
+    }
 
     if (!error && data && data.length > 0) {
       return data.map(mapDbEarningToEarning);
@@ -168,13 +363,12 @@ export async function getAllEarnings(): Promise<EarningEntry[]> {
   }
 
   try {
-    const { users } = await getAllProfiles({ limit: 1000, status: 'active', role: 'user' });
+    const { users } = await getAllProfiles({ status: 'active', role: 'user' });
     const allEarnings: EarningEntry[] = [];
     for (const u of users) {
-      const uEarnings = await getEarningsByUserId(u.id);
+      const uEarnings = await getEarningsByUserId(u.id, options);
       allEarnings.push(...uEarnings);
     }
-    allEarnings.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
     return allEarnings;
   } catch (err: any) {
     return [];

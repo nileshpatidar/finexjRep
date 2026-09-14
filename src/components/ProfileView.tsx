@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { useAuth } from '../context/AuthContext';
+import { useSettings } from '../context/SettingsContext';
 import { api } from '../services/api';
 import { QRCodeSVG } from 'qrcode.react';
 import {
@@ -11,10 +12,20 @@ import {
   Loader2,
   Check,
   Copy,
+  Users,
+  ChevronRight,
+  Lock,
 } from 'lucide-react';
 
-export const ProfileView: React.FC = () => {
+interface ProfileViewProps {
+  onNavigate?: (view: string) => void;
+}
+
+export const ProfileView: React.FC<ProfileViewProps> = ({ onNavigate }) => {
   const { user, logout, logoutAll, refreshUser } = useAuth();
+  const { minimumDepositAmount } = useSettings();
+  const minDeposit = minimumDepositAmount || 300;
+  const [copiedProfileRef, setCopiedProfileRef] = useState(false);
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmNewPassword, setConfirmNewPassword] = useState('');
@@ -24,6 +35,8 @@ export const ProfileView: React.FC = () => {
 
   // 2FA Setup
   const [show2FASetup, setShow2FASetup] = useState(false);
+  const [showDisable2FA, setShowDisable2FA] = useState(false);
+  const [disable2FACode, setDisable2FACode] = useState('');
   const [secretData, setSecretData] = useState<{ secret: string; otpAuthUrl: string } | null>(null);
   const [twoFactorInputCode, setTwoFactorInputCode] = useState('');
   const [twoFactorMessage, setTwoFactorMessage] = useState<string | null>(null);
@@ -46,15 +59,18 @@ export const ProfileView: React.FC = () => {
     try {
       setTwoFactorError(null);
       setTwoFactorMessage(null);
+      const codeToSend = enable ? twoFactorInputCode : disable2FACode;
       const res = await api.toggle2FA({
         enable,
         secret: secretData?.secret,
-        code: twoFactorInputCode,
+        code: codeToSend,
       });
       if (res.success) {
         setTwoFactorMessage(enable ? '2FA Authenticator enabled successfully!' : '2FA Authenticator disabled.');
         setShow2FASetup(false);
+        setShowDisable2FA(false);
         setTwoFactorInputCode('');
+        setDisable2FACode('');
         await refreshUser();
       }
     } catch (err) {
@@ -165,6 +181,81 @@ export const ProfileView: React.FC = () => {
             </p>
           </div>
         </div>
+      </div>
+
+      {/* Referral Credentials & Network Shortcut */}
+      <div className="rounded-3xl bg-white dark:bg-[#0F172A] border border-slate-200 dark:border-slate-800 p-6 sm:p-7 shadow-xl shadow-slate-200/50 dark:shadow-none space-y-4">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center space-x-2">
+            <Users className="w-5 h-5 text-blue-600 dark:text-blue-400" />
+            <h2 className="text-sm font-bold uppercase tracking-wider text-slate-900 dark:text-white">
+              Investor Referral Program
+            </h2>
+          </div>
+          <span className="px-2.5 py-0.5 rounded-full text-xs font-bold bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20">
+            2-TIER REWARDS
+          </span>
+        </div>
+
+        <p className="text-slate-600 dark:text-slate-400 leading-relaxed text-xs">
+          Receive 5% Level 1 direct rewards and 2% Level 2 indirect rewards when your referred investors make qualifying deposits (≥ {minDeposit} USDT). Referral rewards are non-compounding cash.
+        </p>
+
+        {!user?.referralCode ? (
+          <div className="p-4 rounded-2xl bg-amber-500/10 border border-amber-500/20 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="space-y-1">
+              <div className="flex items-center gap-1.5 text-amber-700 dark:text-amber-400 font-bold text-xs">
+                <Lock className="w-3.5 h-3.5" />
+                <span>Refer & Earn is Locked</span>
+              </div>
+              <p className="text-xs text-slate-600 dark:text-slate-400">
+                Maintain at least {minDeposit} USDT in eligible funds in your account to unlock your referral code.
+              </p>
+            </div>
+            {onNavigate && (
+              <button
+                onClick={() => onNavigate('deposit')}
+                className="inline-flex items-center space-x-1.5 px-3 py-2 rounded-xl text-xs font-bold bg-blue-600 hover:bg-blue-700 text-white shadow-xs transition cursor-pointer self-start sm:self-auto"
+              >
+                <span>Deposit to Unlock</span>
+                <ChevronRight className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
+        ) : (
+          <div className="p-4 rounded-2xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div>
+              <span className="text-[11px] font-semibold text-slate-500 uppercase">My Referral Code</span>
+              <p className="text-base font-mono font-black text-slate-900 dark:text-white tracking-wider mt-0.5">
+                {user.referralCode}
+              </p>
+            </div>
+
+            <div className="flex items-center space-x-2">
+              <button
+                onClick={() => {
+                  navigator.clipboard.writeText(user.referralCode!);
+                  setCopiedProfileRef(true);
+                  setTimeout(() => setCopiedProfileRef(false), 2000);
+                }}
+                className="inline-flex items-center space-x-1 px-3 py-2 rounded-xl text-xs font-bold bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-200 transition cursor-pointer"
+              >
+                {copiedProfileRef ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
+                <span>{copiedProfileRef ? 'Copied' : 'Copy Code'}</span>
+              </button>
+
+              {onNavigate && (
+                <button
+                  onClick={() => onNavigate('referrals')}
+                  className="inline-flex items-center space-x-1.5 px-4 py-2 rounded-xl text-xs font-bold bg-blue-600 hover:bg-blue-700 text-white shadow-xs transition cursor-pointer"
+                >
+                  <span>Referral Dashboard</span>
+                  <ChevronRight className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* 2-Factor Authentication (TOTP) */}
@@ -279,13 +370,55 @@ export const ProfileView: React.FC = () => {
             )}
           </div>
         ) : (
-          <button
-            type="button"
-            onClick={() => handleToggle2FA(false)}
-            className="py-2 px-4 rounded-xl bg-red-500/10 hover:bg-red-500/20 text-red-600 dark:text-red-400 border border-red-500/30 font-bold transition cursor-pointer"
-          >
-            Disable 2FA Authenticator
-          </button>
+          <div>
+            {!showDisable2FA ? (
+              <button
+                type="button"
+                onClick={() => {
+                  setShowDisable2FA(true);
+                  setTwoFactorError(null);
+                  setTwoFactorMessage(null);
+                }}
+                className="py-2 px-4 rounded-xl bg-red-500/10 hover:bg-red-500/20 text-red-600 dark:text-red-400 border border-red-500/30 font-bold transition cursor-pointer"
+              >
+                Disable 2FA Authenticator
+              </button>
+            ) : (
+              <div className="p-4 rounded-2xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 space-y-3 max-w-md">
+                <p className="text-xs font-semibold text-slate-700 dark:text-slate-300">
+                  Enter your 6-digit Authenticator code to confirm disabling 2FA:
+                </p>
+                <div className="flex items-center space-x-2">
+                  <input
+                    type="text"
+                    maxLength={6}
+                    value={disable2FACode}
+                    onChange={e => setDisable2FACode(e.target.value)}
+                    placeholder="123456"
+                    className="flex-1 py-2 px-3 rounded-xl bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-700 text-slate-900 dark:text-white font-mono tracking-widest text-center font-bold"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => handleToggle2FA(false)}
+                    disabled={disable2FACode.length !== 6}
+                    className="py-2 px-4 rounded-xl bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white font-bold transition cursor-pointer"
+                  >
+                    Confirm
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowDisable2FA(false);
+                      setDisable2FACode('');
+                    }}
+                    className="py-2 px-3 rounded-xl bg-slate-200 dark:bg-slate-800 hover:bg-slate-300 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 font-medium cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
         )}
       </div>
 

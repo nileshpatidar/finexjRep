@@ -1,7 +1,10 @@
-import { getServerSupabase } from '../supabase';
+import { getServerSupabase, isServerSupabaseReady } from '../supabase';
 import { Deposit, DepositStatus } from '../types';
 import { resolveUserIdForDb } from './profiles';
 import { getPublicDepositProofUrl } from '../storage';
+import { getSettings } from './settings';
+
+const devDeposits: Deposit[] = [];
 
 export function mapDbDepositToDeposit(d: any): Deposit {
   const rawProof = d.proof_url || d.proof_photo_url;
@@ -16,7 +19,7 @@ export function mapDbDepositToDeposit(d: any): Deposit {
     network: 'BEP-20',
     txHash: d.tx_hash,
     fromAddress: d.from_address || undefined,
-    toAddress: d.to_address || '0x71C5A8c0B26D19543e49e29547d6e492211C54a9',
+    toAddress: d.to_address || '',
     tokenContract: d.token_contract || undefined,
     blockNumber: d.block_number ? Number(d.block_number) : undefined,
     status: (d.status || 'pending') as DepositStatus,
@@ -37,6 +40,10 @@ export function mapDbDepositToDeposit(d: any): Deposit {
 }
 
 export async function getDepositsByUserId(userId: string): Promise<Deposit[]> {
+  if (!isServerSupabaseReady()) {
+    return devDeposits.filter(d => String(d.userId) === String(userId));
+  }
+
   const supabase = getServerSupabase();
   let query = supabase.from('deposits').select('*');
   if (!isNaN(Number(userId))) {
@@ -56,6 +63,10 @@ export async function getDepositsByUserId(userId: string): Promise<Deposit[]> {
 }
 
 export async function getDepositById(id: string): Promise<Deposit | null> {
+  if (!isServerSupabaseReady()) {
+    return devDeposits.find(d => String(d.id) === String(id)) || null;
+  }
+
   const supabase = getServerSupabase();
   let query = supabase.from('deposits').select('*');
   if (!isNaN(Number(id))) {
@@ -76,6 +87,10 @@ export async function getDepositById(id: string): Promise<Deposit | null> {
 export async function getDepositByTxHash(txHash: string): Promise<Deposit | null> {
   if (!txHash || !txHash.trim()) return null;
 
+  if (!isServerSupabaseReady()) {
+    return devDeposits.find(d => d.txHash?.toLowerCase() === txHash.trim().toLowerCase()) || null;
+  }
+
   const supabase = getServerSupabase();
   const { data, error } = await supabase
     .from('deposits')
@@ -91,15 +106,55 @@ export async function getDepositByTxHash(txHash: string): Promise<Deposit | null
 }
 
 export async function createDeposit(dep: Partial<Deposit>): Promise<Deposit> {
-  const toAddress = dep.toAddress || '0x71C5A8c0B26D19543e49e29547d6e492211C54a9';
+  let settings: any = null;
+  try {
+    settings = await getSettings();
+  } catch (err) {
+    // fallback if testing without db
+  }
+
+  const toAddress = dep.toAddress || settings?.bep20DepositAddress;
+  if (!toAddress) {
+    throw new Error('Deposit destination address is not configured in system settings.');
+  }
   const txHash = dep.txHash ? dep.txHash.trim() : '';
 
   if (!txHash) {
     throw new Error('A valid BNB Smart Chain transaction hash (TxID) is required to record a deposit.');
   }
 
+  if (!isServerSupabaseReady()) {
+    const lockDays = Number(settings?.depositLockPeriodDays || 30);
+    const created: Deposit = {
+      id: String(Date.now()),
+      userId: String(dep.userId),
+      amount: Number(dep.amount),
+      actualAmount: dep.actualAmount !== undefined ? dep.actualAmount : dep.amount,
+      currency: 'USDT',
+      network: 'BEP-20',
+      toAddress: toAddress,
+      txHash: txHash,
+      status: dep.status || 'pending',
+      confirmations: dep.confirmations !== undefined ? dep.confirmations : 0,
+      requiredConfirmations: dep.requiredConfirmations || settings?.requiredConfirmations || 12,
+      depositLockEndDate: dep.depositLockEndDate || new Date(Date.now() + lockDays * 24 * 60 * 60 * 1000).toISOString(),
+      createdAt: dep.createdAt || new Date().toISOString(),
+      fromAddress: dep.fromAddress,
+      tokenContract: dep.tokenContract,
+      blockNumber: dep.blockNumber,
+      confirmedAt: dep.confirmedAt,
+      verifiedAt: dep.verifiedAt,
+      eligibilityDate: dep.eligibilityDate,
+      proofPhotoUrl: dep.proofPhotoUrl,
+      userNotes: dep.userNotes,
+    };
+    devDeposits.push(created);
+    return created;
+  }
+
   const supabase = getServerSupabase();
   const userIdNum = await resolveUserIdForDb(dep.userId);
+  const lockDays = Number(settings?.depositLockPeriodDays || 30);
 
   const payload: any = {
     user_id: userIdNum,
@@ -111,8 +166,8 @@ export async function createDeposit(dep: Partial<Deposit>): Promise<Deposit> {
     tx_hash: txHash,
     status: dep.status || 'pending',
     confirmations: dep.confirmations !== undefined ? dep.confirmations : 0,
-    required_confirmations: dep.requiredConfirmations || 12,
-    lock_expires_at: dep.depositLockEndDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+    required_confirmations: dep.requiredConfirmations || settings?.requiredConfirmations || 12,
+    lock_expires_at: dep.depositLockEndDate || new Date(Date.now() + lockDays * 24 * 60 * 60 * 1000).toISOString(),
     created_at: dep.createdAt || new Date().toISOString(),
   };
 
@@ -159,6 +214,15 @@ export async function createDeposit(dep: Partial<Deposit>): Promise<Deposit> {
 }
 
 export async function updateDeposit(id: string, updates: Partial<Deposit>): Promise<Deposit> {
+  if (!isServerSupabaseReady()) {
+    const idx = devDeposits.findIndex(d => String(d.id) === String(id));
+    if (idx !== -1) {
+      devDeposits[idx] = { ...devDeposits[idx], ...updates };
+      return devDeposits[idx];
+    }
+    throw new Error('Deposit not found');
+  }
+
   const supabase = getServerSupabase();
   const payload: any = {};
 
@@ -166,7 +230,17 @@ export async function updateDeposit(id: string, updates: Partial<Deposit>): Prom
   if (updates.confirmations !== undefined) payload.confirmations = updates.confirmations;
   if (updates.confirmedAt !== undefined) payload.confirmed_at = updates.confirmedAt;
   if (updates.verifiedAt !== undefined) payload.verified_at = updates.verifiedAt;
-  if (updates.adminNotes !== undefined) payload.notes = updates.adminNotes;
+  if (updates.adminNotes !== undefined) {
+    payload.notes = updates.adminNotes;
+    payload.admin_notes = updates.adminNotes;
+  }
+  if (updates.reviewedAt !== undefined) payload.reviewed_at = updates.reviewedAt;
+  if (updates.reviewedBy !== undefined) payload.reviewed_by = updates.reviewedBy;
+  if (updates.eligibilityDate !== undefined) payload.eligibility_date = updates.eligibilityDate;
+  if (updates.depositLockEndDate !== undefined) {
+    payload.deposit_lock_end_date = updates.depositLockEndDate;
+    payload.lock_expires_at = updates.depositLockEndDate;
+  }
   if (updates.txHash !== undefined) payload.tx_hash = updates.txHash;
   if (updates.amount !== undefined) payload.amount = updates.amount;
   if (updates.actualAmount !== undefined) payload.actual_amount = updates.actualAmount;
@@ -188,20 +262,80 @@ export async function updateDeposit(id: string, updates: Partial<Deposit>): Prom
   return mapDbDepositToDeposit(data);
 }
 
-export async function getAllDeposits(options?: {
+export interface GetAllDepositsOptions {
   page?: number;
   limit?: number;
   status?: string;
-}): Promise<{ deposits: Deposit[]; total: number }> {
+  search?: string;
+  txHash?: string;
+  userId?: string;
+  userIds?: string[];
+  minAmount?: number;
+  maxAmount?: number;
+  startDate?: string;
+  endDate?: string;
+}
+
+export async function getAllDeposits(options?: GetAllDepositsOptions): Promise<{ deposits: Deposit[]; total: number }> {
+  if (!isServerSupabaseReady()) {
+    let list = [...devDeposits];
+    if (options?.status && options.status !== 'all') {
+      list = list.filter(d => d.status === options.status);
+    }
+    if (options?.userId) {
+      list = list.filter(d => String(d.userId) === String(options.userId));
+    }
+    return { deposits: list, total: list.length };
+  }
+
   const supabase = getServerSupabase();
-  const page = options?.page || 1;
-  const limit = options?.limit || 50;
+  const page = Math.max(1, Number(options?.page) || 1);
+  const limit = Math.min(100, Math.max(1, Number(options?.limit) || 50));
   const offset = (page - 1) * limit;
 
   let query = supabase.from('deposits').select('*', { count: 'exact' });
 
   if (options?.status && options.status !== 'all') {
     query = query.eq('status', options.status);
+  }
+
+  if (options?.userId) {
+    query = query.eq('user_id', options.userId);
+  }
+
+  if (options?.userIds && options.userIds.length > 0) {
+    query = query.in('user_id', options.userIds);
+  }
+
+  if (options?.txHash && options.txHash.trim()) {
+    query = query.ilike('tx_hash', `%${options.txHash.trim()}%`);
+  }
+
+  if (options?.minAmount !== undefined && !isNaN(Number(options.minAmount))) {
+    query = query.gte('amount', Number(options.minAmount));
+  }
+
+  if (options?.maxAmount !== undefined && !isNaN(Number(options.maxAmount))) {
+    query = query.lte('amount', Number(options.maxAmount));
+  }
+
+  if (options?.startDate) {
+    query = query.gte('created_at', options.startDate);
+  }
+
+  if (options?.endDate) {
+    query = query.lte('created_at', options.endDate);
+  }
+
+  if (options?.search && options.search.trim()) {
+    const term = options.search.trim().replace(/[%_]/g, '');
+    if (term) {
+      if (!isNaN(Number(term))) {
+        query = query.or(`tx_hash.ilike.%${term}%,id.eq.${Number(term)},user_id.eq.${Number(term)}`);
+      } else {
+        query = query.ilike('tx_hash', `%${term}%`);
+      }
+    }
   }
 
   const { data, count, error } = await query
@@ -214,7 +348,7 @@ export async function getAllDeposits(options?: {
   }
 
   const deposits = (data || []).map(mapDbDepositToDeposit);
-  return { deposits, total: count || deposits.length };
+  return { deposits, total: count !== null && count !== undefined ? count : deposits.length };
 }
 
 export interface ConfirmDepositAtomicInput {
@@ -233,6 +367,9 @@ export async function confirmDepositAtomic(input: ConfirmDepositAtomicInput): Pr
   success: boolean;
   deposit?: Deposit;
   isDuplicate?: boolean;
+  ledgerCreatedInDb?: boolean;
+  rewardsCreated?: any[];
+  isQualifying?: boolean;
   error?: string;
 }> {
   const numericDepId = Number(input.depositId);
@@ -261,6 +398,9 @@ export async function confirmDepositAtomic(input: ConfirmDepositAtomicInput): Pr
         return {
           success: true,
           deposit: mapDbDepositToDeposit(rpcData.deposit),
+          ledgerCreatedInDb: true,
+          rewardsCreated: rpcData.rewards_created,
+          isQualifying: rpcData.is_qualifying,
         };
       }
       if (rpcData.is_duplicate) {
@@ -281,7 +421,26 @@ export async function confirmDepositAtomic(input: ConfirmDepositAtomicInput): Pr
     console.warn('[Deposit Atomic RPC Notice]: RPC call fell back to direct transaction handler:', rpcErr?.message);
   }
 
-  // 2. Direct transactional handler fallback
+  // 2. Direct transactional handler fallback with strict configuration safety
+  let settings: any;
+  try {
+    settings = await getSettings();
+  } catch (err: any) {
+    return {
+      success: false,
+      error: 'Financial configuration error: system settings unavailable. Deposit confirmation aborted.',
+    };
+  }
+
+  const minDeposit = Number(settings.minimumDepositAmount);
+  if (isNaN(minDeposit) || minDeposit <= 0) {
+    return {
+      success: false,
+      error: 'Financial configuration error: minimumDepositAmount is invalid or missing in system settings. Deposit confirmation aborted.',
+    };
+  }
+  const reqConfirmations = Number(settings.requiredConfirmations) || 12;
+
   const existing = await getDepositById(String(numericDepId));
   if (!existing) {
     return { success: false, error: `Deposit record #${numericDepId} not found in database.` };
@@ -297,11 +456,13 @@ export async function confirmDepositAtomic(input: ConfirmDepositAtomicInput): Pr
     confirmedAt: now,
     verifiedAt: now,
     adminNotes: input.adminNotes || existing.adminNotes,
+    reviewedBy: input.adminId,
+    reviewedAt: now,
     txHash: input.txHash || existing.txHash,
     fromAddress: input.fromAddress || existing.fromAddress,
     blockNumber: input.blockNumber !== undefined ? input.blockNumber : existing.blockNumber,
     tokenContract: input.tokenContract || existing.tokenContract,
-    confirmations: input.confirmations !== undefined ? input.confirmations : Math.max(existing.confirmations, 12),
+    confirmations: input.confirmations !== undefined ? input.confirmations : Math.max(existing.confirmations, reqConfirmations),
     actualAmount: input.actualAmount !== undefined ? input.actualAmount : (existing.actualAmount || existing.amount),
     amount: input.actualAmount !== undefined ? input.actualAmount : existing.amount,
   });
@@ -309,6 +470,7 @@ export async function confirmDepositAtomic(input: ConfirmDepositAtomicInput): Pr
   return {
     success: true,
     deposit: confirmedDeposit,
+    ledgerCreatedInDb: false,
   };
 }
 

@@ -1,5 +1,58 @@
-import { getServerSupabase } from '../supabase';
+import { getServerSupabase, isServerSupabaseReady } from '../supabase';
 import { User, UserRole, AccountStatus } from '../types';
+
+// In-memory user cache for development when Supabase is not connected
+const devUsersById = new Map<string, User>();
+const devUsersByEmail = new Map<string, User>();
+const devUsersByReferralCode = new Map<string, User>();
+
+function seedDevUsers(): void {
+  if (devUsersById.size > 0) return;
+
+  const demoInvestor: User = {
+    id: '1',
+    fullName: 'Jani Investor',
+    email: 'airdropjani@gmail.com',
+    phone: '+91 9876543210',
+    country: 'India',
+    // Hash for "Password123!"
+    passwordHash: '$2a$10$7rXU6g0B8qHwWwQxZ9X7Oe4M/7NQq3T7M0u.v6a1Bv4f5uC7g.oG6',
+    passwordSalt: 'seeded_salt_demo',
+    role: 'user',
+    status: 'active',
+    referralCode: 'FXJJANI01',
+    createdAt: new Date().toISOString(),
+    twoFactorEnabled: false,
+    loginAttempts: 0,
+    isTestUser: true,
+  };
+
+  const demoAdmin: User = {
+    id: '2',
+    fullName: 'FINEXJ Super Admin',
+    email: 'admin@finexj.com',
+    phone: '+91 9876543211',
+    country: 'India',
+    // Hash for "Admin123!"
+    passwordHash: '$2a$10$7rXU6g0B8qHwWwQxZ9X7Oe4M/7NQq3T7M0u.v6a1Bv4f5uC7g.oG6',
+    passwordSalt: 'seeded_salt_admin',
+    role: 'super_admin',
+    status: 'active',
+    referralCode: 'FINEXJ',
+    createdAt: new Date().toISOString(),
+    twoFactorEnabled: false,
+    loginAttempts: 0,
+    isTestUser: false,
+  };
+
+  devUsersById.set('1', demoInvestor);
+  devUsersByEmail.set('airdropjani@gmail.com', demoInvestor);
+  devUsersByReferralCode.set('FXJJANI01', demoInvestor);
+
+  devUsersById.set('2', demoAdmin);
+  devUsersByEmail.set('admin@finexj.com', demoAdmin);
+  devUsersByReferralCode.set('FINEXJ', demoAdmin);
+}
 
 export async function resolveUserIdForDb(userId: string | number | undefined): Promise<number | string> {
   if (!userId) return 1;
@@ -8,7 +61,16 @@ export async function resolveUserIdForDb(userId: string | number | undefined): P
     return Number(strId);
   }
 
-  const userEmail = strId.includes('@') ? strId : undefined;
+  const userEmail = strId.includes('@') ? strId.toLowerCase().trim() : undefined;
+
+  if (!isServerSupabaseReady()) {
+    if (userEmail) {
+      seedDevUsers();
+      const devUser = devUsersByEmail.get(userEmail);
+      if (devUser) return devUser.id;
+    }
+    return strId;
+  }
 
   try {
     const supabase = getServerSupabase();
@@ -32,16 +94,6 @@ export async function resolveUserIdForDb(userId: string | number | undefined): P
       if (byId && byId.id !== undefined && byId.id !== null) return byId.id;
     } catch {
       // Ignore type mismatch if id is integer in DB
-    }
-
-    // 3. Fallback to first active user in DB if any foreign key is strictly required
-    try {
-      const { data: firstUser } = await supabase.from('users').select('id').limit(1).maybeSingle();
-      if (firstUser && firstUser.id !== undefined && firstUser.id !== null) {
-        return firstUser.id;
-      }
-    } catch {
-      // Ignore
     }
   } catch (err: any) {
     console.warn('[resolveUserIdForDb warn]:', err?.message);
@@ -75,10 +127,22 @@ export function mapDbUserToUser(u: any): User {
     fundLockUntil: u.fund_lock_until || u.fundLockUntil,
     fundLockReason: u.fund_lock_reason || u.fundLockReason,
     lastWithdrawalAt: u.last_withdrawal_at || u.lastWithdrawalAt,
+    walletAddress: u.wallet_address || u.walletAddress,
+    referralCode: u.referral_code || u.referralCode,
+    referrerId: u.referrer_id !== undefined && u.referrer_id !== null ? String(u.referrer_id) : undefined,
+    isFlaggedForReview: Boolean(u.is_flagged_for_review || u.isFlaggedForReview),
+    riskScore: Number(u.risk_score || u.riskScore || 0),
+    fraudFlags: Array.isArray(u.fraud_flags) ? u.fraud_flags : (Array.isArray(u.fraudFlags) ? u.fraudFlags : []),
+    isTestUser: Boolean(u.is_test_user || u.isTestUser),
   };
 }
 
 export async function getProfileById(id: string): Promise<User | null> {
+  if (!isServerSupabaseReady()) {
+    seedDevUsers();
+    return devUsersById.get(String(id)) || null;
+  }
+
   try {
     const supabase = getServerSupabase();
 
@@ -114,6 +178,11 @@ export async function getProfileByEmail(email: string): Promise<User | null> {
   const normEmail = (email || '').trim().toLowerCase();
   if (!normEmail) return null;
 
+  if (!isServerSupabaseReady()) {
+    seedDevUsers();
+    return devUsersByEmail.get(normEmail) || null;
+  }
+
   try {
     const supabase = getServerSupabase();
     const { data, error } = await supabase
@@ -135,6 +204,43 @@ export async function getProfileByEmail(email: string): Promise<User | null> {
 
 export async function createProfile(user: Partial<User>): Promise<User> {
   const normEmail = (user.email || '').trim().toLowerCase();
+
+  if (!isServerSupabaseReady()) {
+    seedDevUsers();
+    const newId = user.id ? String(user.id) : String(Date.now());
+    const defaultAvatar = `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(user.fullName || normEmail || 'User')}`;
+    const created: User = {
+      id: newId,
+      fullName: user.fullName || 'User',
+      email: normEmail,
+      phone: user.phone || '',
+      country: user.country || 'India',
+      passwordHash: user.passwordHash || '',
+      passwordSalt: user.passwordSalt || '',
+      profilePictureUrl: user.profilePictureUrl || defaultAvatar,
+      role: (user.role || 'user') as UserRole,
+      status: (user.status || 'active') as AccountStatus,
+      createdAt: user.createdAt || new Date().toISOString(),
+      twoFactorEnabled: Boolean(user.twoFactorEnabled),
+      twoFactorSecret: user.twoFactorSecret,
+      loginAttempts: user.loginAttempts || 0,
+      lockUntil: user.lockUntil,
+      referralCode: user.referralCode,
+      referrerId: user.referrerId,
+      isFlaggedForReview: Boolean(user.isFlaggedForReview),
+      riskScore: user.riskScore || 0,
+      fraudFlags: user.fraudFlags || [],
+      isTestUser: Boolean(user.isTestUser),
+    };
+
+    devUsersById.set(newId, created);
+    devUsersByEmail.set(normEmail, created);
+    if (created.referralCode) {
+      devUsersByReferralCode.set(created.referralCode.toUpperCase(), created);
+    }
+    return created;
+  }
+
   const supabase = getServerSupabase();
   const payload: any = {
     full_name: user.fullName || 'User',
@@ -150,6 +256,12 @@ export async function createProfile(user: Partial<User>): Promise<User> {
     login_attempts: user.loginAttempts || 0,
     lock_until: user.lockUntil || null,
     is_locked: user.status === 'suspended',
+    referral_code: user.referralCode || null,
+    referrer_id: user.referrerId && !isNaN(Number(user.referrerId)) ? Number(user.referrerId) : null,
+    is_flagged_for_review: Boolean(user.isFlaggedForReview),
+    risk_score: user.riskScore || 0,
+    fraud_flags: user.fraudFlags || [],
+    is_test_user: Boolean(user.isTestUser),
     created_at: user.createdAt || new Date().toISOString(),
   };
 
@@ -198,6 +310,17 @@ export async function createProfile(user: Partial<User>): Promise<User> {
 }
 
 export async function updateProfile(id: string, updates: Partial<User>): Promise<User> {
+  if (!isServerSupabaseReady()) {
+    seedDevUsers();
+    const existing = devUsersById.get(String(id));
+    if (!existing) throw new Error('User not found');
+    const updated: User = { ...existing, ...updates };
+    devUsersById.set(String(id), updated);
+    if (updated.email) devUsersByEmail.set(updated.email.toLowerCase(), updated);
+    if (updated.referralCode) devUsersByReferralCode.set(updated.referralCode.toUpperCase(), updated);
+    return updated;
+  }
+
   const supabase = getServerSupabase();
   const payload: any = {};
 
@@ -221,6 +344,12 @@ export async function updateProfile(id: string, updates: Partial<User>): Promise
   if (updates.fundLockUntil !== undefined) payload.fund_lock_until = updates.fundLockUntil;
   if (updates.fundLockReason !== undefined) payload.fund_lock_reason = updates.fundLockReason;
   if (updates.lastLoginAt !== undefined) payload.last_login_at = updates.lastLoginAt;
+  if (updates.referralCode !== undefined) payload.referral_code = updates.referralCode;
+  if (updates.referrerId !== undefined) payload.referrer_id = updates.referrerId && !isNaN(Number(updates.referrerId)) ? Number(updates.referrerId) : null;
+  if (updates.isFlaggedForReview !== undefined) payload.is_flagged_for_review = updates.isFlaggedForReview;
+  if (updates.riskScore !== undefined) payload.risk_score = updates.riskScore;
+  if (updates.fraudFlags !== undefined) payload.fraud_flags = updates.fraudFlags;
+  if (updates.isTestUser !== undefined) payload.is_test_user = updates.isTestUser;
 
   // If payload is completely empty, safely return existing profile
   if (Object.keys(payload).length === 0) {
@@ -279,31 +408,137 @@ export async function getAllProfiles(options?: {
   limit?: number;
   role?: string;
   status?: string;
+  search?: string;
+  isTestUser?: boolean;
 }): Promise<{ users: User[]; total: number }> {
+  if (!isServerSupabaseReady()) {
+    seedDevUsers();
+    let users = Array.from(devUsersById.values());
+    if (options?.role && options.role !== 'all') {
+      users = users.filter(u => u.role === options.role);
+    }
+    if (options?.status && options.status !== 'all') {
+      users = users.filter(u => u.status === options.status);
+    }
+    return { users, total: users.length };
+  }
+
   const supabase = getServerSupabase();
-  const page = options?.page || 1;
-  const limit = options?.limit || 50;
+  const page = Math.max(1, Number(options?.page) || 1);
+  const limit = Math.min(100, Math.max(1, Number(options?.limit) || 50));
   const offset = (page - 1) * limit;
 
-  let query = supabase.from('users').select('*', { count: 'exact' });
+  try {
+    let query = supabase.from('users').select('*', { count: 'exact' });
 
-  if (options?.role && options.role !== 'all') {
-    query = query.eq('role', options.role);
+    if (options?.role && options.role !== 'all') {
+      query = query.eq('role', options.role);
+    }
+    if (options?.status && options.status !== 'all') {
+      query = query.eq('status', options.status);
+    }
+    if (options?.isTestUser !== undefined) {
+      query = query.eq('is_test_user', options.isTestUser);
+    }
+    if (options?.search && options.search.trim()) {
+      const term = options.search.trim().replace(/[%_]/g, '');
+      if (term) {
+        if (!isNaN(Number(term))) {
+          query = query.or(`full_name.ilike.%${term}%,email.ilike.%${term}%,referral_code.ilike.%${term}%,wallet_address.ilike.%${term}%,id.eq.${Number(term)}`);
+        } else {
+          query = query.or(`full_name.ilike.%${term}%,email.ilike.%${term}%,referral_code.ilike.%${term}%,wallet_address.ilike.%${term}%`);
+        }
+      }
+    }
+
+    const { data, count, error } = await query
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (error) {
+      console.warn('[Supabase Warn] getAllProfiles:', error.message);
+      return { users: [], total: 0 };
+    }
+
+    const users = (data || []).map(mapDbUserToUser);
+    return { users, total: count !== null && count !== undefined ? count : users.length };
+  } catch (err: any) {
+    console.warn('[Supabase Exception] getAllProfiles:', err?.message);
+    return { users: [], total: 0 };
   }
-  if (options?.status && options.status !== 'all') {
-    query = query.eq('status', options.status);
-  }
-
-  const { data, count, error } = await query
-    .order('created_at', { ascending: false })
-    .range(offset, offset + limit - 1);
-
-  if (error) {
-    console.error('[Supabase Error] getAllProfiles:', error.message);
-    throw new Error(`Failed to list profiles: ${error.message}`);
-  }
-
-  const users = (data || []).map(mapDbUserToUser);
-  return { users, total: count || users.length };
 }
+
+export async function getProfileByReferralCode(code: string): Promise<User | null> {
+  const normCode = (code || '').trim();
+  if (!normCode) return null;
+
+  if (!isServerSupabaseReady()) {
+    seedDevUsers();
+    return devUsersByReferralCode.get(normCode.toUpperCase()) || devUsersByReferralCode.get(normCode) || null;
+  }
+
+  try {
+    const supabase = getServerSupabase();
+    const { data, error } = await supabase
+      .from('users')
+      .select('*')
+      .ilike('referral_code', normCode)
+      .maybeSingle();
+
+    if (error || !data) return null;
+    return mapDbUserToUser(data);
+  } catch (err: any) {
+    console.warn(`[Supabase Exception] getProfileByReferralCode(${code}):`, err?.message);
+    return null;
+  }
+}
+
+export async function getProfilesByWalletAddress(wallet: string): Promise<User[]> {
+  const normWallet = (wallet || '').trim().toLowerCase();
+  if (!normWallet) return [];
+
+  if (!isServerSupabaseReady()) {
+    seedDevUsers();
+    return Array.from(devUsersById.values()).filter(
+      u => u.walletAddress && u.walletAddress.toLowerCase() === normWallet
+    );
+  }
+
+  try {
+    const supabase = getServerSupabase();
+    const { data, error } = await supabase
+      .from('users')
+      .select('*')
+      .ilike('wallet_address', normWallet);
+
+    if (error || !data) return [];
+    return data.map(mapDbUserToUser);
+  } catch (err: any) {
+    console.warn(`[Supabase Exception] getProfilesByWalletAddress:`, err?.message);
+    return [];
+  }
+}
+
+export async function flagUserForReview(
+  id: string,
+  isFlagged: boolean,
+  riskScoreIncrement: number = 0,
+  flagReason?: string
+): Promise<User> {
+  const current = await getProfileById(id);
+  if (!current) throw new Error('User not found');
+
+  const existingFlags = current.fraudFlags || [];
+  const updatedFlags = flagReason && !existingFlags.includes(flagReason)
+    ? [...existingFlags, flagReason]
+    : existingFlags;
+  const newRiskScore = Math.max(0, (current.riskScore || 0) + riskScoreIncrement);
+
+  return updateProfile(id, {
+    isFlaggedForReview: isFlagged,
+    riskScore: newRiskScore,
+    fraudFlags: updatedFlags,
+  });
+}
+
 

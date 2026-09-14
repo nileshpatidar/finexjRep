@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { ThemeProvider } from './context/ThemeContext';
 import { SettingsProvider } from './context/SettingsContext';
+import { MarketTickerProvider } from './context/MarketTickerContext';
 import { api } from './services/api';
 import { DashboardResponse } from './types';
 import { Header } from './components/Header';
@@ -12,6 +13,7 @@ import { EarningsView } from './components/EarningsView';
 import { WithdrawView } from './components/WithdrawView';
 import { ProfileView } from './components/ProfileView';
 import { TransactionsView } from './components/TransactionsView';
+import { ReferralView } from './components/ReferralView';
 import { AdminDashboard } from './components/AdminDashboard';
 import { SupportModal } from './components/SupportModal';
 import { AuthModal } from './components/AuthModal';
@@ -68,6 +70,13 @@ const AppContent: React.FC = () => {
     }
   }, [token, user, fetchDashboard]);
 
+  // Revalidate fresh dashboard balances whenever navigating back to home
+  useEffect(() => {
+    if (currentView === 'home' && token && user && user.role === 'user') {
+      fetchDashboard();
+    }
+  }, [currentView, token, user, fetchDashboard]);
+
   // Handle URL hash / back navigation
   useEffect(() => {
     const handleHashChange = () => {
@@ -120,6 +129,7 @@ const AppContent: React.FC = () => {
                 onNavigate={setCurrentView}
                 onOpenSupport={() => setIsSupportOpen(true)}
                 isLoading={isLoadingDashboard}
+                onRefresh={fetchDashboard}
               />
             )}
 
@@ -135,7 +145,9 @@ const AppContent: React.FC = () => {
 
             {currentView === 'transactions' && <TransactionsView />}
 
-            {currentView === 'profile' && <ProfileView />}
+            {currentView === 'referrals' && <ReferralView onNavigate={setCurrentView} />}
+
+            {currentView === 'profile' && <ProfileView onNavigate={setCurrentView} />}
           </>
         )}
       </main>
@@ -162,7 +174,9 @@ export default function App() {
     <ThemeProvider>
       <AuthProvider>
         <SettingsProvider>
-          <AppContent />
+          <MarketTickerProvider>
+            <AppContent />
+          </MarketTickerProvider>
         </SettingsProvider>
       </AuthProvider>
     </ThemeProvider>
